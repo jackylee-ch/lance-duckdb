@@ -379,8 +379,8 @@ static string EscapeJsonString(const string &s) {
 static bool TryParseWithBool(const string &raw_val, const char *key, bool &out,
                              string &out_error) {
   string val = raw_val;
-  // Honor a single-quoted literal (e.g. replace='true') like a bare token, and
-  // accept the same spellings the DuckDB-native path does in ValueToBoolOrThrow.
+  // Honor a single-quoted literal (e.g. replace='true') like a bare token,
+  // matching the spellings the DuckDB-native ValueToBoolOrThrow accepts.
   if (StartsWithQuotedString(val)) {
     string lit;
     idx_t lit_consumed = 0;
