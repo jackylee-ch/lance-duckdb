@@ -1169,6 +1169,7 @@ public:
     auto props = context.GetClientProperties();
     ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
                                   props);
+    LanceNormalizeArrowListFieldNames(&schema_root.arrow_schema);
 
     auto mode = CreateTableModeFromConflict(create_info.on_conflict);
     vector<const char *> key_ptrs;
@@ -1530,6 +1531,7 @@ public:
           ArrowConverter::ToArrowSchema(&state->schema_root.arrow_schema,
                                         state->column_types,
                                         state->column_names, props);
+          LanceNormalizeArrowListFieldNames(&state->schema_root.arrow_schema);
 
           unordered_map<string, Value> overrides;
           if (!state->bearer_token_override.empty()) {

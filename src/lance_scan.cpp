@@ -3637,6 +3637,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto props = context.GetClientProperties();
       ArrowConverter::ToArrowSchema(&new_schema_root.arrow_schema, types, names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_schema_root.arrow_schema);
 
       vector<string> expressions;
       if (add.new_column.HasDefaultValue()) {
@@ -3732,6 +3733,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
                                     {cast.target_type}, {cast.column_name},
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_type_schema.arrow_schema);
 
       auto rc = lance_dataset_alter_columns_cast(
           dataset, cast.column_name.c_str(), &new_type_schema.arrow_schema);
