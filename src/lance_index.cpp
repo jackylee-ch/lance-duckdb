@@ -992,94 +992,6 @@ static TableFunction LanceInternalIndexesTableTableFunction() {
   return f;
 }
 
-// Returns true if the dataset already has an index named `index_name`. Used to
-// make CREATE INDEX IF NOT EXISTS / DROP INDEX IF EXISTS idempotent without
-// duplicating Lance's index catalog: it reads the same index list that SHOW
-// INDEXES exposes and matches the "index_name" column (exact match, like
-// Lance's own name matching).
-static bool LanceDatasetHasIndex(void *dataset, const string &index_name) {
-  void *stream = lance_create_index_list_stream(dataset);
-  if (!stream) {
-    throw IOException("Failed to open Lance index list stream" +
-                      LanceFormatErrorSuffix());
-  }
-
-  bool found = false;
-  while (!found) {
-    void *batch = nullptr;
-    auto rc = lance_stream_next(stream, &batch);
-    if (rc == 1) {
-      break;
-    }
-    if (rc != 0) {
-      lance_close_stream(stream);
-      throw IOException("Failed to read next Lance RecordBatch" +
-                        LanceFormatErrorSuffix());
-    }
-
-    ArrowArray array;
-    ArrowSchema schema;
-    memset(&array, 0, sizeof(array));
-    memset(&schema, 0, sizeof(schema));
-    if (lance_batch_to_arrow(batch, &array, &schema) != 0) {
-      lance_free_batch(batch);
-      lance_close_stream(stream);
-      throw IOException(
-          "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-          LanceFormatErrorSuffix());
-    }
-    lance_free_batch(batch);
-
-    int64_t name_col = -1;
-    for (int64_t c = 0; c < schema.n_children; c++) {
-      if (schema.children[c]->name &&
-          strcmp(schema.children[c]->name, "index_name") == 0) {
-        name_col = c;
-        break;
-      }
-    }
-
-    if (name_col >= 0 && name_col < array.n_children) {
-      auto *col = array.children[name_col];
-      const char *format = schema.children[name_col]->format;
-      bool large = format && format[0] == 'U';
-      const auto *validity = static_cast<const uint8_t *>(col->buffers[0]);
-      const char *chars = static_cast<const char *>(col->buffers[2]);
-      for (int64_t i = 0; i < col->length && !found; i++) {
-        auto idx = static_cast<idx_t>(col->offset + i);
-        if (validity && !(validity[idx / 8] & (1u << (idx % 8)))) {
-          continue;
-        }
-        int64_t start;
-        int64_t end;
-        if (large) {
-          const auto *off = static_cast<const int64_t *>(col->buffers[1]);
-          start = off[idx];
-          end = off[idx + 1];
-        } else {
-          const auto *off = static_cast<const int32_t *>(col->buffers[1]);
-          start = off[idx];
-          end = off[idx + 1];
-        }
-        if (string(chars + start, static_cast<size_t>(end - start)) ==
-            index_name) {
-          found = true;
-        }
-      }
-    }
-
-    if (array.release) {
-      array.release(&array);
-    }
-    if (schema.release) {
-      schema.release(&schema);
-    }
-  }
-
-  lance_close_stream(stream);
-  return found;
-}
-
 // --- Internal DDL table functions ---
 
 struct LanceIndexDdlBindData final : public FunctionData {
@@ -1377,15 +1289,6 @@ static void LanceCreateIndexFunc(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
-  // CREATE INDEX IF NOT EXISTS: if an index with this name already exists,
-  // succeed without rebuilding it.
-  if (bind_data.conditional && !bind_data.index_name.empty() &&
-      LanceDatasetHasIndex(dataset, bind_data.index_name)) {
-    lance_close_dataset(dataset);
-    output.SetCardinality(0);
-    return;
-  }
-
   vector<const char *> col_ptrs;
   col_ptrs.reserve(bind_data.columns.size());
   for (auto &c : bind_data.columns) {
@@ -1400,11 +1303,25 @@ static void LanceCreateIndexFunc(ClientContext &context,
       dataset, name_ptr, col_ptrs.data(), col_ptrs.size(),
       bind_data.index_type.c_str(), params_ptr, bind_data.replace ? 1 : 0,
       bind_data.train ? 1 : 0);
-  lance_close_dataset(dataset);
   if (rc != 0) {
+    // CREATE INDEX IF NOT EXISTS: Lance itself is the authority on which index
+    // names already exist (including indexes this build cannot read), so treat
+    // its "already exists" error as a no-op success rather than pre-checking a
+    // possibly-incomplete index list. The existing index is never replaced
+    // (replace defaults to false).
+    const char *err = lance_last_error_message();
+    bool already_exists =
+        err &&
+        StringUtil::Contains(StringUtil::Lower(string(err)), "already exists");
+    lance_close_dataset(dataset);
+    if (bind_data.conditional && already_exists) {
+      output.SetCardinality(0);
+      return;
+    }
     throw IOException("Failed to create Lance index" +
                       LanceFormatErrorSuffix());
   }
+  lance_close_dataset(dataset);
   if (bind_data.target_is_table) {
     auto &entry =
         Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
@@ -1454,19 +1371,23 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
                       LanceFormatErrorSuffix());
   }
 
-  // DROP INDEX IF EXISTS: if no index with this name exists, succeed quietly.
-  if (bind_data.conditional &&
-      !LanceDatasetHasIndex(dataset, bind_data.index_name)) {
-    lance_close_dataset(dataset);
-    output.SetCardinality(0);
-    return;
-  }
-
   auto rc = lance_dataset_drop_index(dataset, bind_data.index_name.c_str());
-  lance_close_dataset(dataset);
   if (rc != 0) {
+    // DROP INDEX IF EXISTS: attempt the drop and treat Lance's own "index not
+    // found" as a no-op success. Driving this off Lance's drop (rather than a
+    // possibly-incomplete index list) means an existing index this build
+    // cannot read is still dropped, never silently reported as dropped.
+    const char *err = lance_last_error_message();
+    bool not_found = err && StringUtil::Contains(StringUtil::Lower(string(err)),
+                                                 "not found");
+    lance_close_dataset(dataset);
+    if (bind_data.conditional && not_found) {
+      output.SetCardinality(0);
+      return;
+    }
     throw IOException("Failed to drop Lance index" + LanceFormatErrorSuffix());
   }
+  lance_close_dataset(dataset);
   if (bind_data.target_is_table) {
     auto &entry =
         Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
