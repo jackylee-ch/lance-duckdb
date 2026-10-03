@@ -73,6 +73,21 @@ static bool ConsumeKeyword(string &sql, const string &keyword) {
   return true;
 }
 
+// Consume a whole whitespace-separated keyword sequence (e.g. IF NOT EXISTS)
+// only when all of it matches; otherwise leave `sql` untouched so a leading
+// word like a literal index name named "if" is not swallowed.
+static bool ConsumeKeywordSequence(string &sql,
+                                   const std::vector<const char *> &keywords) {
+  auto rest = sql;
+  for (const auto *kw : keywords) {
+    if (!ConsumeKeyword(rest, kw)) {
+      return false;
+    }
+  }
+  sql = rest;
+  return true;
+}
+
 static bool IsIdentChar(char c) {
   return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
          c == '.';
@@ -977,6 +992,94 @@ static TableFunction LanceInternalIndexesTableTableFunction() {
   return f;
 }
 
+// Returns true if the dataset already has an index named `index_name`. Used to
+// make CREATE INDEX IF NOT EXISTS / DROP INDEX IF EXISTS idempotent without
+// duplicating Lance's index catalog: it reads the same index list that SHOW
+// INDEXES exposes and matches the "index_name" column (exact match, like
+// Lance's own name matching).
+static bool LanceDatasetHasIndex(void *dataset, const string &index_name) {
+  void *stream = lance_create_index_list_stream(dataset);
+  if (!stream) {
+    throw IOException("Failed to open Lance index list stream" +
+                      LanceFormatErrorSuffix());
+  }
+
+  bool found = false;
+  while (!found) {
+    void *batch = nullptr;
+    auto rc = lance_stream_next(stream, &batch);
+    if (rc == 1) {
+      break;
+    }
+    if (rc != 0) {
+      lance_close_stream(stream);
+      throw IOException("Failed to read next Lance RecordBatch" +
+                        LanceFormatErrorSuffix());
+    }
+
+    ArrowArray array;
+    ArrowSchema schema;
+    memset(&array, 0, sizeof(array));
+    memset(&schema, 0, sizeof(schema));
+    if (lance_batch_to_arrow(batch, &array, &schema) != 0) {
+      lance_free_batch(batch);
+      lance_close_stream(stream);
+      throw IOException(
+          "Failed to export Lance RecordBatch to Arrow C Data Interface" +
+          LanceFormatErrorSuffix());
+    }
+    lance_free_batch(batch);
+
+    int64_t name_col = -1;
+    for (int64_t c = 0; c < schema.n_children; c++) {
+      if (schema.children[c]->name &&
+          strcmp(schema.children[c]->name, "index_name") == 0) {
+        name_col = c;
+        break;
+      }
+    }
+
+    if (name_col >= 0 && name_col < array.n_children) {
+      auto *col = array.children[name_col];
+      const char *format = schema.children[name_col]->format;
+      bool large = format && format[0] == 'U';
+      const auto *validity = static_cast<const uint8_t *>(col->buffers[0]);
+      const char *chars = static_cast<const char *>(col->buffers[2]);
+      for (int64_t i = 0; i < col->length && !found; i++) {
+        auto idx = static_cast<idx_t>(col->offset + i);
+        if (validity && !(validity[idx / 8] & (1u << (idx % 8)))) {
+          continue;
+        }
+        int64_t start;
+        int64_t end;
+        if (large) {
+          const auto *off = static_cast<const int64_t *>(col->buffers[1]);
+          start = off[idx];
+          end = off[idx + 1];
+        } else {
+          const auto *off = static_cast<const int32_t *>(col->buffers[1]);
+          start = off[idx];
+          end = off[idx + 1];
+        }
+        if (string(chars + start, static_cast<size_t>(end - start)) ==
+            index_name) {
+          found = true;
+        }
+      }
+    }
+
+    if (array.release) {
+      array.release(&array);
+    }
+    if (schema.release) {
+      schema.release(&schema);
+    }
+  }
+
+  lance_close_stream(stream);
+  return found;
+}
+
 // --- Internal DDL table functions ---
 
 struct LanceIndexDdlBindData final : public FunctionData {
@@ -1012,16 +1115,23 @@ struct LanceIndexDdlBindData final : public FunctionData {
   string params_json;
   bool replace = false;
   bool train = true;
+  // CREATE INDEX IF NOT EXISTS / DROP INDEX IF EXISTS: skip (no-op) when the
+  // existence precondition is already satisfied instead of raising an error.
+  bool conditional = false;
 
   unique_ptr<FunctionData> Copy() const override {
+    unique_ptr<LanceIndexDdlBindData> result;
     if (target_is_table) {
-      return make_uniq<LanceIndexDdlBindData>(catalog, schema, table,
-                                              index_name, columns, index_type,
-                                              params_json, replace, train);
+      result = make_uniq<LanceIndexDdlBindData>(catalog, schema, table,
+                                                index_name, columns, index_type,
+                                                params_json, replace, train);
+    } else {
+      result = make_uniq<LanceIndexDdlBindData>(dataset_uri, index_name,
+                                                columns, index_type,
+                                                params_json, replace, train);
     }
-    return make_uniq<LanceIndexDdlBindData>(dataset_uri, index_name, columns,
-                                            index_type, params_json, replace,
-                                            train);
+    result->conditional = conditional;
+    return std::move(result);
   }
 
   bool Equals(const FunctionData &other_p) const override {
@@ -1034,12 +1144,12 @@ struct LanceIndexDdlBindData final : public FunctionData {
              table == other.table && index_name == other.index_name &&
              columns == other.columns && index_type == other.index_type &&
              params_json == other.params_json && replace == other.replace &&
-             train == other.train;
+             train == other.train && conditional == other.conditional;
     }
     return dataset_uri == other.dataset_uri && index_name == other.index_name &&
            columns == other.columns && index_type == other.index_type &&
            params_json == other.params_json && replace == other.replace &&
-           train == other.train;
+           train == other.train && conditional == other.conditional;
   }
 };
 
@@ -1050,8 +1160,8 @@ struct LanceIndexDdlGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<FunctionData>
 LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
                      vector<LogicalType> &return_types, vector<string> &names) {
-  if (input.inputs.size() != 7) {
-    throw BinderException("__lance_create_index requires 7 inputs");
+  if (input.inputs.size() != 8) {
+    throw BinderException("__lance_create_index requires 8 inputs");
   }
   for (idx_t i = 0; i < input.inputs.size(); i++) {
     if (input.inputs[i].IsNull()) {
@@ -1068,6 +1178,8 @@ LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
       input.inputs[5].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
   auto train =
       input.inputs[6].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  auto if_not_exists =
+      input.inputs[7].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 
   if (dataset_uri.empty()) {
     throw BinderException("__lance_create_index dataset uri cannot be empty");
@@ -1083,18 +1195,20 @@ LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
   names = {"Count"};
   vector<string> columns;
   columns.push_back(std::move(column));
-  return make_uniq<LanceIndexDdlBindData>(
+  auto result = make_uniq<LanceIndexDdlBindData>(
       std::move(dataset_uri), std::move(index_name), std::move(columns),
       NormalizeIndexType(std::move(index_type)), std::move(params_json),
       replace, train);
+  result->conditional = if_not_exists;
+  return std::move(result);
 }
 
 static unique_ptr<FunctionData>
 LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
                           vector<LogicalType> &return_types,
                           vector<string> &names) {
-  if (input.inputs.size() != 9) {
-    throw BinderException("__lance_create_index_table requires 9 inputs");
+  if (input.inputs.size() != 10) {
+    throw BinderException("__lance_create_index_table requires 10 inputs");
   }
   for (idx_t i = 0; i < input.inputs.size(); i++) {
     if (input.inputs[i].IsNull()) {
@@ -1113,6 +1227,8 @@ LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
       input.inputs[7].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
   auto train =
       input.inputs[8].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  auto if_not_exists =
+      input.inputs[9].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 
   if (catalog.empty() || schema.empty() || table.empty()) {
     throw BinderException(
@@ -1139,18 +1255,20 @@ LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
   names = {"Count"};
   vector<string> columns;
   columns.push_back(std::move(column));
-  return make_uniq<LanceIndexDdlBindData>(
+  auto result = make_uniq<LanceIndexDdlBindData>(
       std::move(catalog), std::move(schema), std::move(table),
       std::move(index_name), std::move(columns),
       NormalizeIndexType(std::move(index_type)), std::move(params_json),
       replace, train);
+  result->conditional = if_not_exists;
+  return std::move(result);
 }
 
 static unique_ptr<FunctionData>
 LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
                    vector<LogicalType> &return_types, vector<string> &names) {
-  if (input.inputs.size() != 2) {
-    throw BinderException("__lance_drop_index requires 2 inputs");
+  if (input.inputs.size() != 3) {
+    throw BinderException("__lance_drop_index requires 3 inputs");
   }
   for (idx_t i = 0; i < input.inputs.size(); i++) {
     if (input.inputs[i].IsNull()) {
@@ -1159,6 +1277,8 @@ LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
   }
   auto dataset_uri = input.inputs[0].GetValue<string>();
   auto index_name = input.inputs[1].GetValue<string>();
+  auto if_exists =
+      input.inputs[2].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
   if (dataset_uri.empty()) {
     throw BinderException("__lance_drop_index dataset uri cannot be empty");
   }
@@ -1168,17 +1288,19 @@ LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
 
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
-  return make_uniq<LanceIndexDdlBindData>(
+  auto result = make_uniq<LanceIndexDdlBindData>(
       std::move(dataset_uri), std::move(index_name), vector<string>{}, "", "{}",
       false, true);
+  result->conditional = if_exists;
+  return std::move(result);
 }
 
 static unique_ptr<FunctionData>
 LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
                         vector<string> &names) {
-  if (input.inputs.size() != 4) {
-    throw BinderException("__lance_drop_index_table requires 4 inputs");
+  if (input.inputs.size() != 5) {
+    throw BinderException("__lance_drop_index_table requires 5 inputs");
   }
   for (idx_t i = 0; i < input.inputs.size(); i++) {
     if (input.inputs[i].IsNull()) {
@@ -1190,6 +1312,8 @@ LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
   auto schema = input.inputs[1].GetValue<string>();
   auto table = input.inputs[2].GetValue<string>();
   auto index_name = input.inputs[3].GetValue<string>();
+  auto if_exists =
+      input.inputs[4].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
   if (catalog.empty() || schema.empty() || table.empty()) {
     throw BinderException(
         "__lance_drop_index_table catalog/schema/table cannot be empty");
@@ -1210,9 +1334,11 @@ LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
 
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
-  return make_uniq<LanceIndexDdlBindData>(
+  auto result = make_uniq<LanceIndexDdlBindData>(
       std::move(catalog), std::move(schema), std::move(table),
       std::move(index_name), vector<string>{}, "", "{}", false, true);
+  result->conditional = if_exists;
+  return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -1249,6 +1375,15 @@ static void LanceCreateIndexFunc(ClientContext &context,
   if (!dataset) {
     throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
+  }
+
+  // CREATE INDEX IF NOT EXISTS: if an index with this name already exists,
+  // succeed without rebuilding it.
+  if (bind_data.conditional && !bind_data.index_name.empty() &&
+      LanceDatasetHasIndex(dataset, bind_data.index_name)) {
+    lance_close_dataset(dataset);
+    output.SetCardinality(0);
+    return;
   }
 
   vector<const char *> col_ptrs;
@@ -1319,6 +1454,14 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
                       LanceFormatErrorSuffix());
   }
 
+  // DROP INDEX IF EXISTS: if no index with this name exists, succeed quietly.
+  if (bind_data.conditional &&
+      !LanceDatasetHasIndex(dataset, bind_data.index_name)) {
+    lance_close_dataset(dataset);
+    output.SetCardinality(0);
+    return;
+  }
+
   auto rc = lance_dataset_drop_index(dataset, bind_data.index_name.c_str());
   lance_close_dataset(dataset);
   if (rc != 0) {
@@ -1347,7 +1490,7 @@ static TableFunction LanceCreateIndexTableFunction() {
       "__lance_create_index",
       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-       LogicalType::BOOLEAN},
+       LogicalType::BOOLEAN, LogicalType::BOOLEAN},
       LanceCreateIndexFunc, LanceCreateIndexBind, LanceIndexDdlInitGlobal);
   return function;
 }
@@ -1357,24 +1500,26 @@ static TableFunction LanceCreateIndexTableTableFunction() {
       "__lance_create_index_table",
       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-       LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+       LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+       LogicalType::BOOLEAN},
       LanceCreateIndexFunc, LanceCreateIndexTableBind, LanceIndexDdlInitGlobal);
   return function;
 }
 
 static TableFunction LanceDropIndexTableFunction() {
   TableFunction function(
-      "__lance_drop_index", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+      "__lance_drop_index",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN},
       LanceDropIndexFunc, LanceDropIndexBind, LanceIndexDdlInitGlobal);
   return function;
 }
 
 static TableFunction LanceDropIndexTableTableFunction() {
-  TableFunction function("__lance_drop_index_table",
-                         {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                          LogicalType::VARCHAR, LogicalType::VARCHAR},
-                         LanceDropIndexFunc, LanceDropIndexTableBind,
-                         LanceIndexDdlInitGlobal);
+  TableFunction function(
+      "__lance_drop_index_table",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::BOOLEAN},
+      LanceDropIndexFunc, LanceDropIndexTableBind, LanceIndexDdlInitGlobal);
   return function;
 }
 
@@ -1508,6 +1653,8 @@ struct LanceIndexParseData final : public ParserExtensionParseData {
   string params_json;
   bool replace = false;
   bool train = true;
+  bool if_not_exists = false; // CREATE INDEX IF NOT EXISTS
+  bool if_exists = false;     // DROP INDEX IF EXISTS
 
   unique_ptr<ParserExtensionParseData> Copy() const override {
     auto out = make_uniq<LanceIndexParseData>(kind);
@@ -1520,6 +1667,8 @@ struct LanceIndexParseData final : public ParserExtensionParseData {
     out->params_json = params_json;
     out->replace = replace;
     out->train = train;
+    out->if_not_exists = if_not_exists;
+    out->if_exists = if_exists;
     return std::move(out);
   }
 
@@ -1573,6 +1722,8 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       return ParserExtensionParseResult();
     }
     rest = TrimCopy(rest.substr(strlen("index")));
+
+    bool if_not_exists = ConsumeKeywordSequence(rest, {"if", "not", "exists"});
 
     string index_name;
     idx_t consumed = 0;
@@ -1657,6 +1808,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
     out->params_json = params_json;
     out->replace = replace;
     out->train = train;
+    out->if_not_exists = if_not_exists;
     return ParserExtensionParseResult(std::move(out));
   }
 
@@ -1668,6 +1820,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       return ParserExtensionParseResult();
     }
     rest = TrimCopy(rest.substr(strlen("index")));
+    bool if_exists = ConsumeKeywordSequence(rest, {"if", "exists"});
     string index_name;
     idx_t consumed = 0;
     if (!TryParseIdentifier(rest, index_name, consumed)) {
@@ -1710,6 +1863,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
     out->target_sql = target_sql;
     out->target_is_path = target_is_path;
     out->dataset_uri = dataset_uri;
+    out->if_exists = if_exists;
     return ParserExtensionParseResult(std::move(out));
   }
 
@@ -1809,6 +1963,7 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
           Value(parse_data->params_json),
           Value::BOOLEAN(parse_data->replace),
           Value::BOOLEAN(parse_data->train),
+          Value::BOOLEAN(parse_data->if_not_exists),
       };
     } else {
       if (!qname) {
@@ -1827,6 +1982,7 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
           Value(parse_data->params_json),
           Value::BOOLEAN(parse_data->replace),
           Value::BOOLEAN(parse_data->train),
+          Value::BOOLEAN(parse_data->if_not_exists),
       };
     }
     result.return_type = StatementReturnType::NOTHING;
@@ -1839,14 +1995,16 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
       }
       result.function = LanceDropIndexTableFunction();
       result.parameters = {Value(parse_data->dataset_uri),
-                           Value(parse_data->index_name)};
+                           Value(parse_data->index_name),
+                           Value::BOOLEAN(parse_data->if_exists)};
     } else {
       if (!qname) {
         throw InternalException("DROP INDEX is missing a target");
       }
       result.function = LanceDropIndexTableTableFunction();
       result.parameters = {Value(qname->catalog), Value(qname->schema),
-                           Value(qname->name), Value(parse_data->index_name)};
+                           Value(qname->name), Value(parse_data->index_name),
+                           Value::BOOLEAN(parse_data->if_exists)};
     }
     result.return_type = StatementReturnType::NOTHING;
     break;

@@ -372,3 +372,58 @@ SELECT count(*)
 FROM lance_fts('test/.tmp/index_ddl_text.lance', 'text', 'document', k = 10);
 ----
 2
+
+# ---------------------------------------------------------------------------
+# CREATE / DROP INDEX IF [NOT] EXISTS: idempotent DDL
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE INDEX IF NOT EXISTS text_ine_idx ON 'test/.tmp/index_ddl_text.lance' (text)
+USING INVERTED;
+
+# A second IF NOT EXISTS with the same name is a no-op, not an error.
+statement ok
+CREATE INDEX IF NOT EXISTS text_ine_idx ON 'test/.tmp/index_ddl_text.lance' (text)
+USING INVERTED;
+
+# Without IF NOT EXISTS, re-creating an existing index name still errors.
+statement error
+CREATE INDEX text_ine_idx ON 'test/.tmp/index_ddl_text.lance' (text)
+USING INVERTED;
+----
+Failed to create Lance index
+
+# DROP INDEX IF EXISTS removes the index.
+statement ok
+DROP INDEX IF EXISTS text_ine_idx ON 'test/.tmp/index_ddl_text.lance';
+
+# DROP INDEX IF EXISTS on a missing index is a no-op, not an error.
+statement ok
+DROP INDEX IF EXISTS text_ine_idx ON 'test/.tmp/index_ddl_text.lance';
+
+# Without IF EXISTS, dropping a missing index still errors.
+statement error
+DROP INDEX text_ine_idx ON 'test/.tmp/index_ddl_text.lance';
+----
+Failed to drop Lance index
+
+# Same idempotent semantics on an attached-namespace table name.
+statement ok
+ATTACH 'test/.tmp' AS f07ns (TYPE LANCE);
+
+statement ok
+CREATE INDEX IF NOT EXISTS attached_ine ON f07ns.main.index_ddl_text (text)
+USING INVERTED;
+
+statement ok
+CREATE INDEX IF NOT EXISTS attached_ine ON f07ns.main.index_ddl_text (text)
+USING INVERTED;
+
+statement ok
+DROP INDEX IF EXISTS attached_ine ON f07ns.main.index_ddl_text;
+
+statement ok
+DROP INDEX IF EXISTS attached_ine ON f07ns.main.index_ddl_text;
+
+statement ok
+DETACH f07ns;
