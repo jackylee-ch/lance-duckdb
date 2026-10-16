@@ -475,7 +475,10 @@ VACUUM LANCE 'path/to/dataset.lance' WITH (
 Returns:
 - `Operation` (`cleanup`)
 - `Target`
-- `MetricsJSON` (cleanup metrics such as removed bytes / versions)
+- `MetricsJSON` (`bytes_removed`, `old_versions`, `failed_deletes`)
+
+Notes:
+- Cleanup is best-effort: a file that cannot be deleted is counted in `failed_deletes` and left in place for a later run instead of failing the statement.
 
 ### `ALTER INDEX ... OPTIMIZE`
 
