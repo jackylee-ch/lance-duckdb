@@ -1,6 +1,5 @@
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -11,7 +10,6 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -82,33 +80,6 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
   out_plan = plan_ptr;
   lance_free_string(plan_ptr);
   return true;
-}
-
-// TryResolveLanceTableEntry() is now defined in lance_common.cpp so that
-// the maintenance helpers (compact / cleanup / optimize_index /
-// auto_cleanup) can share the same "catalog.schema.table" -> entry
-// resolution logic.
-
-static shared_ptr<LanceDatasetCacheEntry>
-OpenSearchDatasetEntry(ClientContext &context, const Value &input,
-                       const string &function_name, string &out_display_uri,
-                       bool *out_cache_hit) {
-  out_display_uri = ResolveLanceDatasetUri(
-      context, input, LanceResolvePolicy::FALLBACK_TO_PATH, function_name);
-  auto input_str = input.GetValue<string>();
-  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
-    if (StringUtil::CIEquals(out_display_uri, table->DatasetUri())) {
-      return LanceGetOrOpenDatasetEntryForTable(context, *table,
-                                                out_display_uri, out_cache_hit);
-    }
-  }
-
-  auto entry =
-      LanceGetOrOpenDatasetEntry(context, out_display_uri, out_cache_hit);
-  if (entry) {
-    out_display_uri = entry->DisplayUri();
-  }
-  return entry;
 }
 
 static vector<float> ParseQueryVector(const Value &value,
@@ -187,22 +158,11 @@ static vector<float> ParseQueryVector(const Value &value,
 
 static string ParseOptionalNamedString(const TableFunctionBindInput &input,
                                        const string &name) {
-  auto it = input.named_parameters.find(name);
+  auto it = input.named_parameters.find(Identifier(name));
   if (it == input.named_parameters.end() || it->second.IsNull()) {
     return string();
   }
   return it->second.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
-}
-
-static LanceTableEntry *
-TryResolveNamespaceBackedSearchTable(ClientContext &context,
-                                     const Value &input) {
-  auto input_str = input.GetValue<string>();
-  auto *table = TryResolveLanceTableEntry(context, input_str);
-  if (!table || !table->IsNamespaceBacked()) {
-    return nullptr;
-  }
-  return table;
 }
 
 static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
@@ -210,8 +170,8 @@ static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
                                            const string &function_name,
                                            const string &argument_name) {
   for (auto &col : table.GetColumns().Physical()) {
-    if (StringUtil::CIEquals(col.Name(), column)) {
-      return col.Name();
+    if (StringUtil::CIEquals(col.Name().GetIdentifierName(), column)) {
+      return col.Name().GetIdentifierName();
     }
   }
   throw InvalidInputException(function_name + " requires " + argument_name +
@@ -223,14 +183,14 @@ static void PopulateNamespaceSearchSchema(
     ClientContext &context, const LanceTableEntry &table,
     const string &metric_name, ArrowSchemaWrapper &schema_root,
     ArrowTableSchema &arrow_table, vector<string> &result_names,
-    vector<LogicalType> &result_types, vector<string> &names,
+    vector<LogicalType> &result_types, vector<Identifier> &names,
     vector<LogicalType> &return_types) {
   vector<string> field_names;
   vector<LogicalType> field_types;
   field_names.reserve(table.GetColumns().PhysicalColumnCount() + 1);
   field_types.reserve(table.GetColumns().PhysicalColumnCount() + 1);
   for (auto &col : table.GetColumns().Physical()) {
-    field_names.push_back(col.Name());
+    field_names.push_back(col.Name().GetIdentifierName());
     field_types.push_back(col.Type());
   }
   field_names.push_back(metric_name);
@@ -245,7 +205,9 @@ static void PopulateNamespaceSearchSchema(
                                                schema_root.arrow_schema);
   result_names = arrow_table.GetNames();
   result_types = arrow_table.GetTypes();
-  names = result_names;
+  for (const auto &name : result_names) {
+    names.emplace_back(name);
+  }
   return_types = result_types;
 }
 
@@ -380,21 +342,23 @@ CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
       mark_unencodable(*expr);
       continue;
     }
-    if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
-      auto &cmp = expr->Cast<BoundComparisonExpression>();
-      if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
-          cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    if (BoundComparisonExpression::IsComparison(*expr)) {
+      auto &cmp = expr->Cast<BoundFunctionExpression>();
+      if (cmp.GetExpressionType() == ExpressionType::COMPARE_DISTINCT_FROM ||
+          cmp.GetExpressionType() ==
+              ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         auto is_constant = [](const unique_ptr<Expression> &node) -> bool {
           if (!node) {
             return false;
           }
-          if (node->expression_class == ExpressionClass::BOUND_CONSTANT) {
+          if (node->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
             return true;
           }
-          if (node->expression_class == ExpressionClass::BOUND_CAST) {
-            auto &cast = node->Cast<BoundCastExpression>();
-            return !cast.try_cast && cast.child &&
-                   cast.child->expression_class ==
+          if (BoundCastExpression::IsCast(*node)) {
+            auto &cast = node->Cast<BoundFunctionExpression>();
+            return !BoundCastExpression::IsTryCast(cast) &&
+                   cast.GetChildren()[0] &&
+                   cast.GetChildren()[0]->GetExpressionClass() ==
                        ExpressionClass::BOUND_CONSTANT;
           }
           return false;
@@ -404,15 +368,18 @@ CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
           if (!node) {
             return false;
           }
-          return node->expression_class == ExpressionClass::BOUND_COLUMN_REF ||
-                 node->expression_class == ExpressionClass::BOUND_REF;
+          return node->GetExpressionClass() ==
+                     ExpressionClass::BOUND_COLUMN_REF ||
+                 node->GetExpressionClass() == ExpressionClass::BOUND_REF;
         };
 
         // Exempt from completeness: these comparisons are routed through
         // `pushdown_expression` into TableFilters and reach Lance as prefilter
         // SQL, so nothing is lost.
-        if ((is_column(cmp.left) && is_constant(cmp.right)) ||
-            (is_column(cmp.right) && is_constant(cmp.left))) {
+        if ((is_column(cmp.GetChildren()[0]) &&
+             is_constant(cmp.GetChildren()[1])) ||
+            (is_column(cmp.GetChildren()[1]) &&
+             is_constant(cmp.GetChildren()[0]))) {
           continue;
         }
       }
@@ -450,18 +417,18 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
 
 static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
                                     Expression &expr) {
-  if (expr.expression_class != ExpressionClass::BOUND_COMPARISON) {
+  if (!BoundComparisonExpression::IsComparison(expr)) {
     return false;
   }
-  auto &cmp = expr.Cast<BoundComparisonExpression>();
-  return cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
-         cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+  auto &cmp = expr.Cast<BoundFunctionExpression>();
+  return cmp.GetExpressionType() == ExpressionType::COMPARE_DISTINCT_FROM ||
+         cmp.GetExpressionType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
 static unique_ptr<FunctionData>
 LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                       vector<LogicalType> &return_types,
-                      vector<string> &names) {
+                      vector<Identifier> &names) {
   if (input.inputs.size() < 3) {
     throw InvalidInputException(
         "lance_vector_search requires (path, vector_column, vector)");
@@ -549,8 +516,11 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto target = ResolveLanceDataset(context, input.inputs[0],
+                                    LanceResolvePolicy::FALLBACK_TO_PATH,
+                                    "lance_vector_search");
+  auto table = target.table;
+  if (table && table->IsNamespaceBacked()) {
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
@@ -569,9 +539,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_vector_search",
-                             result->file_path, &result->dataset_cache_hit);
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -604,7 +573,10 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
-  names = result->names;
+  names.clear();
+  for (const auto &name : result->names) {
+    names.emplace_back(name);
+  }
   return_types = result->types;
   return std::move(result);
 }
@@ -743,31 +715,13 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-
-  lance_free_batch(batch);
-
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
     local_state.global_state->record_batch_rows.fetch_add(rows);
-  }
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
   }
 
   local_state.chunk = std::move(new_chunk);
@@ -884,8 +838,7 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   return result;
 }
 
-static InsertionOrderPreservingMap<string>
-LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
+static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
   InsertionOrderPreservingMap<string> result;
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto &global_state = input.global_state->Cast<LanceKnnGlobalState>();
@@ -922,7 +875,7 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   result["Lance Rows Out"] = to_string(global_state.lines_read.load());
 
   if (bind_data.namespace_backed) {
-    return result;
+    input.operator_metrics.SetExtraInfo(std::move(result));
   }
 
   if (!global_state.explain_computed.load()) {
@@ -952,25 +905,27 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
     result["Lance Plan Error"] = global_state.explain_error;
   }
 
-  return result;
+  input.operator_metrics.SetExtraInfo(std::move(result));
 }
 
 static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
-    fun.named_parameters["k"] = LogicalType::BIGINT;
-    fun.named_parameters["nprobs"] = LogicalType::BIGINT;
-    fun.named_parameters["refine_factor"] = LogicalType::BIGINT;
-    fun.named_parameters["prefilter"] = LogicalType::BOOLEAN;
-    fun.named_parameters["use_index"] = LogicalType::BOOLEAN;
-    fun.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
-    fun.named_parameters["filter"] = LogicalType::VARCHAR;
+    fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("k", LogicalType::BIGINT);
+      options.Add("nprobs", LogicalType::BIGINT);
+      options.Add("refine_factor", LogicalType::BIGINT);
+      options.Add("prefilter", LogicalType::BOOLEAN);
+      options.Add("use_index", LogicalType::BOOLEAN);
+      options.Add("explain_verbose", LogicalType::BOOLEAN);
+      options.Add("filter", LogicalType::VARCHAR);
+    });
     fun.projection_pushdown = true;
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
     fun.pushdown_complex_filter = LancePushdownComplexFilter;
     fun.to_string = LanceKnnToString;
-    fun.dynamic_to_string = LanceKnnDynamicToString;
+    fun.get_metrics = LanceKnnGetMetrics;
   };
 
   TableFunction search_f32("lance_vector_search",
@@ -1136,29 +1091,12 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
-
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   local_state.global_state->record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   local_state.global_state->record_batch_rows.fetch_add(rows);
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
 
   local_state.chunk = std::move(new_chunk);
   local_state.Reset();
@@ -1168,7 +1106,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
 static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
                                              TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types,
-                                             vector<string> &names) {
+                                             vector<Identifier> &names) {
   if (input.inputs.size() < 3) {
     throw InvalidInputException(
         "lance_fts requires (path, text_column, query)");
@@ -1208,8 +1146,11 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto target =
+      ResolveLanceDataset(context, input.inputs[0],
+                          LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
+  auto table = target.table;
+  if (table && table->IsNamespaceBacked()) {
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
@@ -1228,9 +1169,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   }
 
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_fts",
-                             result->file_path, &result->dataset_cache_hit);
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -1262,14 +1202,17 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
-  names = result->names;
+  names.clear();
+  for (const auto &name : result->names) {
+    names.emplace_back(name);
+  }
   return_types = result->types;
   return std::move(result);
 }
 
 static unique_ptr<FunctionData>
 LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
-                vector<LogicalType> &return_types, vector<string> &names) {
+                vector<LogicalType> &return_types, vector<Identifier> &names) {
   if (input.inputs.size() < 5) {
     throw InvalidInputException("lance_hybrid_search requires (path, "
                                 "vector_column, vector, text_column, text)");
@@ -1298,9 +1241,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_hybrid_search",
-                             result->file_path, &result->dataset_cache_hit);
+  auto target = ResolveLanceDataset(context, input.inputs[0],
+                                    LanceResolvePolicy::FALLBACK_TO_PATH,
+                                    "lance_hybrid_search");
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->vector_column = input.inputs[1].GetValue<string>();
@@ -1408,7 +1353,10 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
-  names = result->names;
+  names.clear();
+  for (const auto &name : result->names) {
+    names.emplace_back(name);
+  }
   return_types = result->types;
   return std::move(result);
 }
@@ -1606,8 +1554,7 @@ LanceSearchToString(TableFunctionToStringInput &input) {
   return LanceSearchBindToString(bind_data);
 }
 
-static InsertionOrderPreservingMap<string>
-LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
+static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto result = LanceSearchBindToString(bind_data);
   auto &global_state = input.global_state->Cast<LanceSearchGlobalState>();
@@ -1624,7 +1571,7 @@ LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
       to_string(global_state.record_batch_rows.load());
   result["Lance Rows Out"] = to_string(global_state.lines_read.load());
 
-  return result;
+  input.operator_metrics.SetExtraInfo(std::move(result));
 }
 
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
@@ -1633,35 +1580,40 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
       LanceSearchFunc, LanceFtsBind, LanceSearchInitGlobal,
       LanceSearchLocalInit);
-  fts.named_parameters["k"] = LogicalType::BIGINT;
-  fts.named_parameters["prefilter"] = LogicalType::BOOLEAN;
-  fts.named_parameters["filter"] = LogicalType::VARCHAR;
+
+  fts.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+    options.Add("k", LogicalType::BIGINT);
+    options.Add("prefilter", LogicalType::BOOLEAN);
+    options.Add("filter", LogicalType::VARCHAR);
+  });
   fts.projection_pushdown = true;
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
   fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
   fts.to_string = LanceSearchToString;
-  fts.dynamic_to_string = LanceSearchDynamicToString;
+  fts.get_metrics = LanceSearchGetMetrics;
   loader.RegisterFunction(fts);
 }
 
 static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
-    fun.named_parameters["k"] = LogicalType::BIGINT;
-    fun.named_parameters["nprobs"] = LogicalType::BIGINT;
-    fun.named_parameters["refine_factor"] = LogicalType::BIGINT;
-    fun.named_parameters["prefilter"] = LogicalType::BOOLEAN;
-    fun.named_parameters["use_index"] = LogicalType::BOOLEAN;
-    fun.named_parameters["alpha"] = LogicalType::FLOAT;
-    fun.named_parameters["oversample_factor"] = LogicalType::INTEGER;
+    fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("k", LogicalType::BIGINT);
+      options.Add("nprobs", LogicalType::BIGINT);
+      options.Add("refine_factor", LogicalType::BIGINT);
+      options.Add("prefilter", LogicalType::BOOLEAN);
+      options.Add("use_index", LogicalType::BOOLEAN);
+      options.Add("alpha", LogicalType::FLOAT);
+      options.Add("oversample_factor", LogicalType::INTEGER);
+    });
     fun.projection_pushdown = true;
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
     fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
     fun.to_string = LanceSearchToString;
-    fun.dynamic_to_string = LanceSearchDynamicToString;
+    fun.get_metrics = LanceSearchGetMetrics;
   };
 
   TableFunction hybrid_f32("lance_hybrid_search",
