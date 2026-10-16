@@ -68,6 +68,7 @@ struct CleanupOldVersionsOptionsInput {
 struct CleanupOldVersionsMetricsOutput {
     bytes_removed: u64,
     old_versions: u64,
+    failed_deletes: u64,
 }
 
 impl Default for CleanupOldVersionsOptionsInput {
@@ -894,6 +895,9 @@ fn dataset_cleanup_old_versions_with_options_struct(
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
                 old_versions: stats.old_versions,
+                // Lance keeps going past files it cannot delete; report them so
+                // a partial cleanup is not mistaken for a complete one.
+                failed_deletes: stats.failed_deletes,
             };
             write_metrics_json(
                 &metrics,
