@@ -126,7 +126,7 @@ static bool TryExtractRowIdsFromChunk(Vector &rowid_vec, idx_t count,
   out_error.clear();
 
   UnifiedVectorFormat format;
-  rowid_vec.ToUnifiedFormat(count, format);
+  rowid_vec.ToUnifiedFormat(format);
   auto row_ids = UnifiedVectorFormat::GetData<int64_t>(format);
 
   out_row_ids.reserve(count);
@@ -175,7 +175,7 @@ static void AppendMergeReturningRows(ClientContext &context,
 
   DataChunk out;
   out.Initialize(context, output_types);
-  out.SetCardinality(rows.size());
+  out.SetChildCardinality(rows.size());
 
   for (idx_t c = 0; c < rows.ColumnCount(); c++) {
     out.data[c].Reference(rows.data[c]);
@@ -199,7 +199,7 @@ ConvertBlobInputChunkToBinary(ClientContext &context, DataChunk &chunk,
                               DataChunk &out) {
   if (chunk.ColumnCount() == 0) {
     out.Initialize(context, vector<LogicalType>());
-    out.SetCardinality(chunk.size());
+    out.SetChildCardinality(chunk.size());
     return;
   }
   auto props = context.GetClientProperties();
@@ -347,7 +347,8 @@ static void ConvertArrowArrayToDuckDataChunk(ClientContext &context,
 
   out.Reset();
   out.Initialize(context, types);
-  out.SetCardinality(NumericCast<idx_t>(scan_state.chunk->arrow_array.length));
+  out.SetChildCardinality(
+      NumericCast<idx_t>(scan_state.chunk->arrow_array.length));
   ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), out,
                                     true, DConstants::INVALID_INDEX);
 }
@@ -733,12 +734,11 @@ void PhysicalLanceMergeInto::ComputeMatches(LanceMergeLocalState &local_state,
   local_state.not_matched_by_source_count = 0;
 
   UnifiedVectorFormat rowid_data;
-  chunk.data[row_id_index].ToUnifiedFormat(chunk.size(), rowid_data);
+  chunk.data[row_id_index].ToUnifiedFormat(rowid_data);
 
   if (source_marker.IsValid()) {
     UnifiedVectorFormat source_data;
-    chunk.data[source_marker.GetIndex()].ToUnifiedFormat(chunk.size(),
-                                                         source_data);
+    chunk.data[source_marker.GetIndex()].ToUnifiedFormat(source_data);
     for (idx_t i = 0; i < chunk.size(); i++) {
       auto source_idx = source_data.sel->get_index(i);
       auto rowid_idx = rowid_data.sel->get_index(i);
@@ -848,7 +848,7 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
       }
       return types;
     }());
-    needed_values.SetCardinality(update_values.size());
+    needed_values.SetChildCardinality(update_values.size());
     for (idx_t i = 0; i < needed_assigned_columns.size(); i++) {
       auto input_idx =
           std::find(assigned_columns.begin(), assigned_columns.end(),
@@ -866,7 +866,7 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
     auto patch_rows = [&](DataChunk &taken, idx_t row_offset) {
       DataChunk patched;
       patched.Initialize(context.client, table_column_types);
-      patched.SetCardinality(taken.size());
+      patched.SetChildCardinality(taken.size());
       for (idx_t column_idx = 0; column_idx < table_column_types.size();
            column_idx++) {
         if (!returning_needed[column_idx]) {
@@ -882,9 +882,8 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
       }
       for (idx_t i = 0; i < needed_assigned_columns.size(); i++) {
         for (idx_t row_idx = 0; row_idx < taken.size(); row_idx++) {
-          patched.SetValue(
-              needed_assigned_columns[i], row_idx,
-              returning_values.data[i].GetValue(row_offset + row_idx));
+          patched.data[needed_assigned_columns[i]].SetValue(
+              row_idx, returning_values.data[i].GetValue(row_offset + row_idx));
         }
       }
       AppendMergeReturningRows(context.client, gstate.return_collection,
@@ -894,7 +893,7 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
     if (taken_names.empty()) {
       DataChunk empty_taken;
       empty_taken.Initialize(context.client, {LogicalType::BOOLEAN});
-      empty_taken.SetCardinality(row_ids.size());
+      empty_taken.SetChildCardinality(row_ids.size());
       patch_rows(empty_taken, 0);
     } else {
       gstate.ForEachTakenChunkSubset(context.client, row_ids, taken_names,
@@ -910,7 +909,7 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
   auto value_batch_types = update_values.GetTypes();
   value_batch_types.push_back(rowid_type);
   value_batch.Initialize(context.client, value_batch_types);
-  value_batch.SetCardinality(row_ids.size());
+  value_batch.SetChildCardinality(row_ids.size());
   for (idx_t c = 0; c < update_values.ColumnCount(); c++) {
     value_batch.data[c].Reference(update_values.data[c]);
   }
@@ -959,7 +958,7 @@ void PhysicalLanceMergeInto::HandleMergeInsertRows(
     }
     DataChunk needed_values;
     needed_values.Initialize(context.client, needed_input_types);
-    needed_values.SetCardinality(insert_values.size());
+    needed_values.SetChildCardinality(insert_values.size());
     for (idx_t i = 0; i < needed_to_table.size(); i++) {
       needed_values.data[i].Reference(insert_values.data[needed_to_table[i]]);
     }
@@ -971,7 +970,7 @@ void PhysicalLanceMergeInto::HandleMergeInsertRows(
 
     DataChunk patched;
     patched.Initialize(context.client, table_column_types);
-    patched.SetCardinality(insert_values.size());
+    patched.SetChildCardinality(insert_values.size());
     for (idx_t column_idx = 0; column_idx < table_column_types.size();
          column_idx++) {
       if (!returning_needed[column_idx]) {
@@ -1017,7 +1016,7 @@ void PhysicalLanceMergeInto::HandleMergeDeleteRows(
     auto patch_rows = [&](DataChunk &taken) {
       DataChunk patched;
       patched.Initialize(context.client, table_column_types);
-      patched.SetCardinality(taken.size());
+      patched.SetChildCardinality(taken.size());
       for (idx_t column_idx = 0; column_idx < table_column_types.size();
            column_idx++) {
         if (!returning_needed[column_idx]) {
@@ -1038,7 +1037,7 @@ void PhysicalLanceMergeInto::HandleMergeDeleteRows(
     if (taken_names.empty()) {
       DataChunk empty_taken;
       empty_taken.Initialize(context.client, {LogicalType::BOOLEAN});
-      empty_taken.SetCardinality(row_ids.size());
+      empty_taken.SetChildCardinality(row_ids.size());
       patch_rows(empty_taken);
     } else {
       gstate.ForEachTakenChunkSubset(
@@ -1252,9 +1251,8 @@ PhysicalLanceMergeInto::GetDataInternal(ExecutionContext &, DataChunk &chunk,
       return SourceResultType::FINISHED;
     }
     source_state.emitted = true;
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0,
-                   Value::BIGINT(NumericCast<int64_t>(gstate.changed_rows)));
+    chunk.data[0].Append(
+        Value::BIGINT(NumericCast<int64_t>(gstate.changed_rows)));
     return SourceResultType::FINISHED;
   }
 

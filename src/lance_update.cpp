@@ -151,7 +151,7 @@ public:
 
     DataChunk value_chunk;
     value_chunk.Initialize(context.client, value_chunk_types);
-    value_chunk.SetCardinality(chunk.size());
+    value_chunk.SetChildCardinality(chunk.size());
     for (idx_t i = 0; i < set_chunk_indices.size(); i++) {
       value_chunk.data[i].Reference(chunk.data[set_chunk_indices[i]]);
     }
@@ -251,9 +251,8 @@ public:
     state.emitted = true;
 
     auto &gstate = sink_state->Cast<LanceUpdateValueGlobalState>();
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0,
-                   Value::BIGINT(NumericCast<int64_t>(gstate.rows_updated)));
+    chunk.data[0].Append(
+        Value::BIGINT(NumericCast<int64_t>(gstate.rows_updated)));
     return SourceResultType::FINISHED;
   }
 

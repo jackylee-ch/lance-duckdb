@@ -692,7 +692,7 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   }
 
   UnifiedVectorFormat format;
-  src.ToUnifiedFormat(count, format);
+  src.ToUnifiedFormat(format);
   auto src_data = UnifiedVectorFormat::GetData<uint64_t>(format);
 
   dst.SetVectorType(VectorType::FLAT_VECTOR);
@@ -2110,7 +2110,7 @@ static void LanceFillDeferredColumns(ClientContext &context,
 
   try {
     local_state.deferred_converted.Reset();
-    local_state.deferred_converted.SetCardinality(surviving_count);
+    local_state.deferred_converted.SetChildCardinality(surviving_count);
     ArrowTableFunction::ArrowToDuckDB(local_state, take_table.GetColumns(),
                                       local_state.deferred_converted);
   } catch (...) {
@@ -2194,7 +2194,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     local_state.rows_scanned += output_size;
 
     local_state.scan_converted.Reset();
-    local_state.scan_converted.SetCardinality(output_size);
+    local_state.scan_converted.SetChildCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
                                       local_state.scan_converted);
 
@@ -2204,7 +2204,6 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
         throw InternalException(
             "Lance scan output column count does not match mapping");
       }
-      target.SetCardinality(output_size);
       for (idx_t i = 0; i < target.ColumnCount(); i++) {
         if (global_state.output_is_empty[i]) {
           target.data[i].Reference(Value::BOOLEAN(true), count_t(output_size));
@@ -2241,11 +2240,11 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
         }
         target.data[i].Reference(local_state.scan_converted.data[scan_idx]);
       }
+      target.CheckCardinality(output_size);
     };
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
       fill_output_from_converted(local_state.all_columns);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
@@ -2259,7 +2258,6 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
       fill_output_from_converted(output);
       local_state.chunk_offset += output_size;
@@ -3611,7 +3609,7 @@ static void LanceExecFunc(ClientContext &context, TableFunctionInput &data,
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     global_state.lines_read.fetch_add(output_size);
 
-    output.SetCardinality(output_size);
+    output.SetChildCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(
         local_state, bind_data.arrow_table.GetColumns(), output, false);
     local_state.chunk_offset += output_size;

@@ -219,8 +219,7 @@ public:
                                  txn);
     }
 
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0, Value::BIGINT(deleted_rows));
+    chunk.data[0].Append(Value::BIGINT(deleted_rows));
     return SourceResultType::FINISHED;
   }
 

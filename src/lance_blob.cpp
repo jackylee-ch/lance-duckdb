@@ -221,8 +221,8 @@ idx_t NormalizeIngestRowsInChunk(ClientContext &context, DataChunk &chunk) {
     // union member. VectorStructBuffer::SetValue requires a flat vector.
     chunk.data[column_idx].Flatten();
     for (auto &replacement : replacements) {
-      chunk.SetValue(column_idx, replacement.first,
-                     LanceMakeBytesBlobInputValue(replacement.second));
+      chunk.data[column_idx].SetValue(
+          replacement.first, LanceMakeBytesBlobInputValue(replacement.second));
       materialized++;
     }
   }

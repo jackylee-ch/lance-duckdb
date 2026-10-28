@@ -1611,9 +1611,8 @@ public:
           state.emitted = true;
 
           auto &gstate = sink_state->Cast<GlobalState>();
-          chunk.SetCardinality(1);
-          chunk.SetValue(
-              0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
+          chunk.data[0].Append(
+              Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
           return SourceResultType::FINISHED;
         }
 

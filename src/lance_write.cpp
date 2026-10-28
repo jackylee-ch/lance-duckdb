@@ -278,10 +278,8 @@ public:
 
   SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
                                    OperatorSourceInput &) const override {
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0,
-                   Value::BIGINT(NumericCast<int64_t>(
-                       sink_state->Cast<LanceWriteGlobalState>().count)));
+    chunk.data[0].Append(Value::BIGINT(
+        NumericCast<int64_t>(sink_state->Cast<LanceWriteGlobalState>().count)));
     return SourceResultType::FINISHED;
   }
 
