@@ -1749,11 +1749,13 @@ public:
         create_info.columns.GetColumnTypes(), plan);
   }
 
+  // Lance plans DELETE before the child plan exists, so a plain
+  // `DELETE FROM t` can drop whole fragments instead of scanning every row id.
   PhysicalOperator &PlanDelete(ClientContext &context,
                                PhysicalPlanGenerator &planner,
                                LogicalDelete &op) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
-      return PlanLanceDelete(context, planner, op);
+      return PlanLanceDelete(context, planner, op, nullptr);
     }
     return Catalog::PlanDelete(context, planner, op);
   }
@@ -1789,8 +1791,7 @@ PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
   if (!lance_table) {
     return DuckCatalog::PlanDelete(context, planner, op, plan);
   }
-  (void)plan;
-  return PlanLanceDelete(context, planner, op);
+  return PlanLanceDelete(context, planner, op, &plan);
 }
 
 static unique_ptr<Catalog>
