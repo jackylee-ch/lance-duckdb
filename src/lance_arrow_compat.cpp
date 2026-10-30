@@ -1,4 +1,10 @@
 #include "lance_arrow_compat.hpp"
+#include "lance_common.hpp"
+#include "lance_ffi.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
+
+#include <memory>
 
 #include <algorithm>
 #include <cstdint>
@@ -9,6 +15,40 @@
 #include <vector>
 
 namespace duckdb {
+
+bool LanceArrowFieldContainsBlob(const ArrowSchema &field) {
+  if (field.metadata) {
+    ArrowSchemaMetadata metadata(field.metadata);
+    if (metadata.GetOption("lance-encoding:blob") == "true" ||
+        metadata.GetOption("ARROW:extension:name") == "lance.blob.v2") {
+      return true;
+    }
+  }
+  if (field.dictionary && LanceArrowFieldContainsBlob(*field.dictionary)) {
+    return true;
+  }
+  for (int64_t child_idx = 0; child_idx < field.n_children; child_idx++) {
+    if (field.children && field.children[child_idx] &&
+        LanceArrowFieldContainsBlob(*field.children[child_idx])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+LanceArrowBatch::LanceArrowBatch(void *batch, const char *export_error) {
+  std::unique_ptr<void, decltype(&lance_free_batch)> batch_owner(
+      batch, lance_free_batch);
+  array = make_shared_ptr<ArrowArrayWrapper>();
+  array->arrow_array = {};
+  schema.arrow_schema = {};
+  if (lance_batch_to_arrow(batch, &array->arrow_array, &schema.arrow_schema) !=
+      0) {
+    throw IOException(string(export_error) + LanceFormatErrorSuffix());
+  }
+  batch_owner.reset();
+  LanceCoerceArrowArrayForDuckDB(&schema.arrow_schema, &array->arrow_array);
+}
 
 namespace {
 
@@ -161,17 +201,18 @@ void CoerceArrayRecursive(const ArrowSchema *schema, ArrowArray *array,
       if (total > 0) {
         size_t out_bytes =
             static_cast<size_t>(total) * rule->coerced_element_size;
-        void *new_buf = std::malloc(out_bytes);
+        std::unique_ptr<void, decltype(&std::free)> new_buf(
+            std::malloc(out_bytes), std::free);
         if (!new_buf) {
           throw std::bad_alloc();
         }
-        rule->convert(array->buffers[1], new_buf, total);
+        rule->convert(array->buffers[1], new_buf.get(), total);
         ArrayOverride::Entry entry;
         entry.array = array;
         entry.original_buffer = array->buffers[1];
-        entry.new_buffer = new_buf;
+        entry.new_buffer = new_buf.get();
         state.entries.push_back(entry);
-        array->buffers[1] = new_buf;
+        array->buffers[1] = new_buf.release();
       }
     }
   }
@@ -292,6 +333,26 @@ void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
   }
   array->private_data = state;
   array->release = ArrayReleaseWrapper;
+}
+
+void LanceNormalizeArrowListFieldNames(ArrowSchema *schema) {
+  if (!schema || schema->release == nullptr) {
+    return;
+  }
+  static constexpr const char ARROW_LIST_ITEM_NAME[] = "item";
+  if (schema->format &&
+      (std::strcmp(schema->format, "+l") == 0 ||
+       std::strcmp(schema->format, "+L") == 0) &&
+      schema->n_children == 1 && schema->children && schema->children[0]) {
+    // DuckDB assigns a string literal here, so overwriting the pointer with
+    // another literal keeps the producer's release callback correct.
+    schema->children[0]->name = ARROW_LIST_ITEM_NAME;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (schema->children && schema->children[i]) {
+      LanceNormalizeArrowListFieldNames(schema->children[i]);
+    }
+  }
 }
 
 } // namespace duckdb

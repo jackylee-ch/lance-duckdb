@@ -1,6 +1,6 @@
 #pragma once
 
-#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 
 #include <string>
 #include <vector>
@@ -36,8 +36,39 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
                                     ArrowArray *array);
 
+// Consumes the opaque Rust batch, including when export or coercion throws.
+// The schema retains its original formats for column mapping. Arrays have
+// already been widened for DuckDB; callers that consume the schema must coerce
+// it separately. Keep array alive while DuckDB vectors reference its buffers.
+struct LanceArrowBatch {
+  explicit LanceArrowBatch(
+      void *batch,
+      const char *export_error =
+          "Failed to export Lance RecordBatch to Arrow C Data Interface");
+  LanceArrowBatch(const LanceArrowBatch &) = delete;
+  LanceArrowBatch &operator=(const LanceArrowBatch &) = delete;
+
+  ArrowSchemaWrapper schema;
+  shared_ptr<ArrowArrayWrapper> array;
+};
+
 // Quick predicate — true when the schema contains any type that the coercion
 // helpers above would rewrite.
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema);
+
+// True when this field, or any nested child, carries a Lance blob marker
+// (Blob v1 or Blob v2). Ordinary Arrow binary fields do not match.
+bool LanceArrowFieldContainsBlob(const ArrowSchema &field);
+
+// DuckDB's Arrow exporter names list child fields `l`; Arrow (and therefore
+// Lance, pyarrow and DataFusion) call them `item`. Lance persists the name, and
+// DataFusion's array-function coercion rewrites any list argument to an `item`
+// field — which wraps a non-`item` column in a cast and hides it from Lance's
+// scalar-index planner, so `array_has_any` / `array_has_all` can never reach a
+// LABEL_LIST index. Rewrite the name on every DuckDB → Lance write boundary.
+//
+// Call on the ROOT ArrowSchema before handing it to Lance. Names are rewritten
+// to static storage, so no allocation is added to the producer's lifetime.
+void LanceNormalizeArrowListFieldNames(ArrowSchema *schema);
 
 } // namespace duckdb
