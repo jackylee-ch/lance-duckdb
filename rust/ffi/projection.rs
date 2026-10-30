@@ -6,7 +6,7 @@ use lance::Dataset;
 use lance_core::datatypes::{BlobHandling, Schema};
 use lance_datafusion::projection::ProjectionPlan;
 
-use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, SCORE_COLUMN};
+use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, ROW_ID_COLUMN, SCORE_COLUMN};
 
 pub(crate) fn build_base_projection(schema: &ArrowSchema) -> Arc<[String]> {
     let mut cols = Vec::with_capacity(schema.fields().len());
@@ -17,9 +17,10 @@ pub(crate) fn build_base_projection(schema: &ArrowSchema) -> Arc<[String]> {
 }
 
 pub(crate) fn build_fts_projection(base_projection: &Arc<[String]>) -> Arc<[String]> {
-    let mut cols = Vec::with_capacity(base_projection.len() + 1);
+    let mut cols = Vec::with_capacity(base_projection.len() + 2);
     cols.extend(base_projection.iter().cloned());
     cols.push(SCORE_COLUMN.to_string());
+    cols.push(ROW_ID_COLUMN.to_string());
     cols.into()
 }
 
@@ -41,11 +42,14 @@ pub(crate) fn build_knn_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
 }
 
 pub(crate) fn build_fts_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
-    append_search_metric(schema, SCORE_COLUMN)
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)));
+    fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
+    Arc::new(ArrowSchema::new(fields))
 }
 
 pub(crate) fn build_hybrid_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
-    let mut fields = Vec::with_capacity(schema.fields().len() + 3);
+    let mut fields = Vec::with_capacity(schema.fields().len() + 4);
     for field in schema.fields() {
         fields.push(field.clone());
     }
@@ -60,6 +64,7 @@ pub(crate) fn build_hybrid_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
         DataType::Float32,
         true,
     )));
+    fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
     Arc::new(ArrowSchema::new(fields))
 }
 
