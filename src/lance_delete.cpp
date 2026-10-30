@@ -1,6 +1,7 @@
 #include "duckdb.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -20,6 +21,25 @@
 namespace duckdb {
 
 namespace {
+
+void PinLanceDeleteScans(PhysicalOperator &op, const LanceTableEntry &table,
+                         const shared_ptr<LanceDatasetCacheEntry> &dataset) {
+  if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+    auto &scan = op.Cast<PhysicalTableScan>();
+    if (scan.function.GetName().GetIdentifierName() == "__lance_table_scan" &&
+        scan.bind_data) {
+      auto &bind = scan.bind_data->Cast<LanceScanBindData>();
+      if (bind.table_entry.get() == &table) {
+        // REST query_table cannot select the version pinned by this DELETE.
+        // Its row ids must come from this native dataset instead.
+        bind.dataset_entry = dataset;
+      }
+    }
+  }
+  for (auto &child : op.children) {
+    PinLanceDeleteScans(child.get(), table, dataset);
+  }
+}
 
 // A plain `DELETE FROM t` (no WHERE, no USING) plans as a bare scan of the
 // target. Lance then drops whole fragments instead of DuckDB streaming every
@@ -50,13 +70,16 @@ bool IsUnfilteredLanceScan(LogicalOperator &node) {
 // Hands a staged Lance transaction to the DuckDB transaction, which commits
 // or frees it.
 void RegisterLanceDeleteTransaction(ClientContext &context,
-                                    LanceTableEntry &table, string open_path,
-                                    vector<string> option_keys,
-                                    vector<string> option_values, void *txn) {
-  RegisterLancePendingAppend(context, table.catalog, std::move(open_path),
-                             std::move(option_keys), std::move(option_values),
+                                    LanceTableEntry &table,
+                                    shared_ptr<LanceDatasetCacheEntry> dataset,
+                                    void *txn) {
+  // Keep the dataset's store, credentials and commit handler until commit or
+  // rollback. Resolving the namespace again could target a replacement table.
+  auto display_uri = dataset->DisplayUri();
+  RegisterLancePendingAppend(context, table.catalog, std::move(display_uri), {},
+                             {},
                              LanceBuildDatasetCacheKeyForTable(context, table),
-                             txn);
+                             txn, std::move(dataset));
 }
 
 class LanceDeleteGlobalState : public GlobalSinkState {
@@ -150,13 +173,6 @@ public:
     auto &gstate = input.global_state.Cast<LanceDeleteGlobalState>();
     lock_guard<mutex> guard(gstate.lock);
 
-    string open_path;
-    vector<string> option_keys;
-    vector<string> option_values;
-    string display_uri;
-    ResolveLanceStorageOptionsForTable(context, table, open_path, option_keys,
-                                       option_values, display_uri);
-
     void *txn = nullptr;
     int64_t deleted_rows = 0;
     auto rc = lance_delete_finish_uncommitted(gstate.delete_handle, &txn,
@@ -165,13 +181,11 @@ public:
     gstate.delete_handle = nullptr;
     if (rc != 0) {
       throw IOException("Failed to create Lance DELETE transaction for '" +
-                        open_path + "'" + LanceFormatErrorSuffix());
+                        dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
     }
     gstate.rows_deleted = NumericCast<idx_t>(deleted_rows);
     if (txn) {
-      RegisterLanceDeleteTransaction(context, table, std::move(open_path),
-                                     std::move(option_keys),
-                                     std::move(option_values), txn);
+      RegisterLanceDeleteTransaction(context, table, dataset, txn);
     }
     return SinkFinalizeType::READY;
   }
@@ -233,24 +247,15 @@ public:
     }
     state.emitted = true;
 
-    string open_path;
-    vector<string> option_keys;
-    vector<string> option_values;
-    string display_uri;
-    ResolveLanceStorageOptionsForTable(context.client, table, open_path,
-                                       option_keys, option_values, display_uri);
-
     void *txn = nullptr;
     int64_t deleted_rows = 0;
     if (lance_delete_all_uncommitted(dataset->Handle(), &txn, &deleted_rows) !=
         0) {
       throw IOException("Failed to create Lance DELETE transaction for '" +
-                        open_path + "'" + LanceFormatErrorSuffix());
+                        dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
     }
     if (txn) {
-      RegisterLanceDeleteTransaction(
-          context.client, table, std::move(open_path), std::move(option_keys),
-          std::move(option_values), txn);
+      RegisterLanceDeleteTransaction(context.client, table, dataset, txn);
     }
     chunk.data[0].Append(Value::BIGINT(deleted_rows));
     return SourceResultType::FINISHED;
@@ -284,7 +289,8 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
 
   // The statement-scoped dataset cache returns the handle that native scans
   // of the target bound, so their row ids and the Lance transaction share one
-  // version. REST `query_table` scans read the server's version instead.
+  // version. The child scans below also retain this entry instead of reading
+  // row ids from an independently resolved REST query_table request.
   string display_uri;
   auto dataset =
       LanceGetOrOpenDatasetEntryForTable(context, *lance_table, display_uri);
@@ -299,6 +305,7 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
   }
 
   auto &child = plan ? *plan : planner.CreatePlan(*op.children[0]);
+  PinLanceDeleteScans(child, *lance_table, dataset);
   auto &row_id = op.expressions[0]->Cast<BoundReferenceExpression>();
   auto &del = planner.Make<PhysicalLanceDelete>(
       op.types, *lance_table, std::move(dataset), row_id.Index(),

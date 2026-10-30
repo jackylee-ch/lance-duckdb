@@ -1292,8 +1292,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.output_is_forced_null.push_back(false);
   }
 
-  // Blob projection forces native access, but the bind schema stays unchanged.
-  // Store the native Arrow schema here so byte buffers decode with its layout.
+  // Blob projection and DELETE's pinned dataset force native access, but the
+  // bind schema stays unchanged. Decode with the native dataset's Arrow schema.
   auto open_native_dataset = [&]() {
     if (scan_state.native_dataset) {
       return;
@@ -1304,8 +1304,13 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
     auto &table = bind_data.table_entry.get_mutable()->Cast<LanceTableEntry>();
     string display_uri;
-    scan_state.native_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
-        context, table, display_uri, &scan_state.native_dataset_cache_hit);
+    scan_state.native_dataset_entry = bind_data.dataset_entry;
+    if (!scan_state.native_dataset_entry) {
+      scan_state.native_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+          context, table, display_uri, &scan_state.native_dataset_cache_hit);
+    } else {
+      display_uri = scan_state.native_dataset_entry->DisplayUri();
+    }
     scan_state.native_dataset = scan_state.native_dataset_entry
                                     ? scan_state.native_dataset_entry->Handle()
                                     : nullptr;
@@ -1357,7 +1362,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         context, scan_state.native_scan_arrow_table,
         scan_state.native_scan_schema_root.arrow_schema);
   };
-  if (bind_data.UsesNamespaceQuery() && has_projected_blob) {
+  if (bind_data.UsesNamespaceQuery() &&
+      (has_projected_blob || bind_data.dataset_entry)) {
     open_native_dataset();
   }
 
