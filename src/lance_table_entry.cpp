@@ -59,7 +59,9 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
                                              ArrowSchema &schema,
                                              ArrowTableSchema &arrow_table) {
   LanceTableSchema result;
-  result.coerced_columns = LanceCoerceArrowSchemaForDuckDB(&schema);
+  auto coercion = LanceCoerceArrowSchemaForDuckDB(&schema);
+  result.coerced_columns = std::move(coercion.storage_coerced_columns);
+  result.json_columns = std::move(coercion.json_columns);
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
@@ -196,6 +198,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
   vector<string> coerced;
+  vector<string> json_columns;
   vector<bool> blob_columns;
   vector<string> writable_blob_v2_columns;
   try {
@@ -203,6 +206,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
     create_info.columns = std::move(live.columns);
     create_info.constraints = std::move(live.constraints);
     coerced = std::move(live.coerced_columns);
+    json_columns = std::move(live.json_columns);
     blob_columns = std::move(live.blob_columns);
     writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
     LoadLanceColumnComments(dataset, create_info.columns);
@@ -220,6 +224,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
                                        base.DatasetUri());
   }
   entry->SetCoercedColumnNames(std::move(coerced));
+  entry->SetJsonColumnNames(std::move(json_columns));
   entry->SetBlobColumns(std::move(blob_columns));
   entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
 
@@ -338,20 +343,30 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       LanceNormalizeArrowListFieldNames(&new_schema_root.arrow_schema);
 
       vector<string> expressions;
-      if (add.new_column.HasDefaultValue()) {
-        if (types[0].id() == LogicalTypeId::BLOB) {
-          // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
-          // default with the native binder/evaluator, then hand the exact
-          // bytes to the existing expression path as a hex literal. Only
-          // constant-foldable BLOB defaults are supported: URI ingestion is a
-          // DML value contract, not a stored default.
-          try {
-            auto default_binder = Binder::CreateBinder(context);
-            vector<unique_ptr<Expression>> bound_defaults;
-            default_binder->BindDefaultValue(
-                add.new_column, bound_defaults,
-                catalog.GetName().GetIdentifierName(),
-                schema.name.GetIdentifierName());
+      const bool has_default = add.new_column.HasDefaultValue();
+      string default_sql;
+      if (has_default) {
+        try {
+          // DuckDB rebinds stored defaults for subsequent DML. Validate them
+          // before committing the external schema change.
+          auto default_binder = Binder::CreateBinder(context);
+          vector<unique_ptr<Expression>> bound_defaults;
+          default_binder->BindDefaultValue(
+              add.new_column, bound_defaults,
+              catalog.GetName().GetIdentifierName(),
+              schema.name.GetIdentifierName());
+          if (bound_defaults.size() != 1 || !bound_defaults[0]) {
+            throw InternalException(
+                "DuckDB default binder returned an unexpected result");
+          }
+          default_sql = add.new_column.DefaultValue().ToString();
+
+          if (types[0].id() == LogicalTypeId::BLOB) {
+            // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
+            // default with the native binder/evaluator, then hand the exact
+            // bytes to the existing expression path as a hex literal. Only
+            // constant-foldable BLOB defaults are supported: URI ingestion is
+            // a DML value contract, not a stored default.
             auto &bound_default = *bound_defaults[0];
             if (!bound_default.IsFoldable() || bound_default.IsVolatile()) {
               throw NotImplementedException(
@@ -372,12 +387,12 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
               auto bytes = default_value.GetValueUnsafe<string_t>().GetString();
               expressions.push_back("X'" + LanceHexEncode(bytes) + "'");
             }
-          } catch (...) {
-            lance_close_dataset(dataset);
-            throw;
+          } else {
+            expressions.push_back(default_sql);
           }
-        } else {
-          expressions.push_back(add.new_column.DefaultValue().ToString());
+        } catch (...) {
+          lance_close_dataset(dataset);
+          throw;
         }
       }
       vector<const char *> expr_ptrs;
@@ -402,14 +417,13 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       // is visible to the metadata updater.
       lance_close_dataset(dataset);
       dataset = nullptr;
-      if (add.new_column.HasDefaultValue()) {
+      if (has_default) {
         string reopen_uri;
         dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
         if (dataset) {
-          auto default_expr = add.new_column.DefaultValue().ToString();
           (void)lance_dataset_update_field_metadata(
               dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
-              default_expr.c_str());
+              default_sql.c_str());
           lance_close_dataset(dataset);
           dataset = nullptr;
         }
@@ -589,9 +603,19 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
         make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
+  copy->SetJsonColumnNames(json_column_names);
   copy->SetBlobColumns(blob_column_flags);
   copy->SetWritableBlobV2Columns(writable_blob_v2_columns);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
+}
+
+bool LanceTableEntry::IsJsonColumn(const string &name) const {
+  for (const auto &json_column : json_column_names) {
+    if (StringUtil::CIEquals(json_column, name)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool LanceTableEntry::IsWritableBlobV2Column(
@@ -659,6 +683,9 @@ static vector<idx_t> NotNullIndexesFromConstraints(
 //   FLOAT) are indistinguishable by name/type, yet the entry's
 //   coerced-column list gates writes (INSERT/UPDATE/MERGE reject coerced
 //   columns);
+// - the JSON-column list: JSON and plain VARCHAR share the same DuckDB type,
+//   while catalog entries and query plan bindings must carry the same logical
+//   identity;
 // - the nullability state: external ALTER SET/DROP NOT NULL changes only
 //   the Arrow flags, which the entry mirrors as NOT NULL constraints;
 // - stored defaults, which native INSERT/UPDATE binding reads from this entry.
@@ -668,6 +695,7 @@ bool LanceTableEntry::MatchesLiveSchemaState(
     const LanceTableSchema &live) const {
   if (columns.LogicalColumnCount() != live.columns.LogicalColumnCount() ||
       CoercedColumnNames() != live.coerced_columns ||
+      json_column_names != live.json_columns ||
       writable_blob_v2_columns != live.writable_blob_v2_columns ||
       NotNullIndexesFromConstraints(constraints) !=
           NotNullIndexesFromConstraints(live.constraints)) {

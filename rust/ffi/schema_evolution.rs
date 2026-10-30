@@ -7,13 +7,14 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use arrow::compute;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::{Duration, Utc};
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
 use lance::index::DatasetIndexExt;
 use lance::Dataset;
+use lance_arrow::json::has_json_fields;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
@@ -619,6 +620,17 @@ fn dataset_alter_columns_cast_inner(
     let new_type = type_schema.fields()[0].data_type().clone();
 
     let mut ds = (*handle.dataset).clone();
+    // ColumnAlteration carries only the target DataType, not the source
+    // field's JSON metadata, so reject the physical JSON source first.
+    if let Some(source_field) = ds.schema().field(&path) {
+        let source_field = ArrowField::from(source_field);
+        if has_json_fields(&source_field) {
+            return Err(FfiError::new(
+                ErrorCode::DatasetAlterColumns,
+                format!("ALTER COLUMN TYPE does not support Lance JSON source column '{path}'"),
+            ));
+        }
+    }
     let alteration = ColumnAlteration::new(path).cast_to(new_type);
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
