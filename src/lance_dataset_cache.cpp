@@ -83,14 +83,22 @@ public:
     revalidated_keys.insert(key);
   }
 
-  void PinForWrite(const string &key,
+  void PinForWrite(idx_t query_id, const string &key,
                    shared_ptr<LanceDatasetCacheEntry> entry) {
     lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      write_datasets.clear();
+      write_query_id = query_id;
+    }
     write_datasets[key] = std::move(entry);
   }
 
-  shared_ptr<LanceDatasetCacheEntry> GetPinnedForWrite(const string &key) {
+  shared_ptr<LanceDatasetCacheEntry> GetPinnedForWrite(idx_t query_id,
+                                                       const string &key) {
     lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      return nullptr;
+    }
     auto entry = write_datasets.find(key);
     return entry == write_datasets.end() ? nullptr : entry->second;
   }
@@ -133,6 +141,9 @@ private:
   // Retained independently of the cache map so invalidation cannot change a
   // write's target generation while other pipelines in the statement read it.
   unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> write_datasets;
+  // QueryBegin/QueryEnd may span a submission expanded into several statements.
+  // DuckDB's active query number distinguishes those statement boundaries.
+  idx_t write_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
   idx_t query_revalidations = 0;
@@ -159,6 +170,7 @@ void LancePinDatasetForWrite(ClientContext &context,
                              const LanceTableEntry &table,
                              shared_ptr<LanceDatasetCacheEntry> dataset) {
   GetOrCreateLanceDatasetCacheState(context)->PinForWrite(
+      context.transaction.GetActiveQuery(),
       LanceBuildDatasetCacheKeyForTable(context, table), std::move(dataset));
 }
 
@@ -166,6 +178,7 @@ shared_ptr<LanceDatasetCacheEntry>
 LanceGetDatasetPinnedForWrite(ClientContext &context,
                               const LanceTableEntry &table) {
   return GetOrCreateLanceDatasetCacheState(context)->GetPinnedForWrite(
+      context.transaction.GetActiveQuery(),
       LanceBuildDatasetCacheKeyForTable(context, table));
 }
 
