@@ -1,7 +1,6 @@
 #include "duckdb.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -21,25 +20,6 @@
 namespace duckdb {
 
 namespace {
-
-void PinLanceDeleteScans(PhysicalOperator &op, const LanceTableEntry &table,
-                         const shared_ptr<LanceDatasetCacheEntry> &dataset) {
-  if (op.type == PhysicalOperatorType::TABLE_SCAN) {
-    auto &scan = op.Cast<PhysicalTableScan>();
-    if (scan.function.GetName().GetIdentifierName() == "__lance_table_scan" &&
-        scan.bind_data) {
-      auto &bind = scan.bind_data->Cast<LanceScanBindData>();
-      if (bind.table_entry.get() == &table) {
-        // REST query_table cannot select the version pinned by this DELETE.
-        // Its row ids must come from this native dataset instead.
-        bind.dataset_entry = dataset;
-      }
-    }
-  }
-  for (auto &child : op.children) {
-    PinLanceDeleteScans(child.get(), table, dataset);
-  }
-}
 
 // A plain `DELETE FROM t` (no WHERE, no USING) plans as a bare scan of the
 // target. Lance then drops whole fragments instead of DuckDB streaming every
@@ -289,8 +269,8 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
 
   // The statement-scoped dataset cache returns the handle that native scans
   // of the target bound, so their row ids and the Lance transaction share one
-  // version. The child scans below also retain this entry instead of reading
-  // row ids from an independently resolved REST query_table request.
+  // version. All reads of the target in this statement, including CTEs and
+  // correlated subqueries outside the DELETE subtree, use the same entry.
   string display_uri;
   auto dataset =
       LanceGetOrOpenDatasetEntryForTable(context, *lance_table, display_uri);
@@ -298,6 +278,7 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
     throw IOException("Failed to open Lance dataset for DELETE: " +
                       display_uri + LanceFormatErrorSuffix());
   }
+  LancePinDatasetForWrite(context, *lance_table, dataset);
 
   if (!plan && IsUnfilteredLanceScan(*op.children[0])) {
     return planner.Make<PhysicalLanceDeleteAll>(
@@ -305,7 +286,6 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
   }
 
   auto &child = plan ? *plan : planner.CreatePlan(*op.children[0]);
-  PinLanceDeleteScans(child, *lance_table, dataset);
   auto &row_id = op.expressions[0]->Cast<BoundReferenceExpression>();
   auto &del = planner.Make<PhysicalLanceDelete>(
       op.types, *lance_table, std::move(dataset), row_id.Index(),
