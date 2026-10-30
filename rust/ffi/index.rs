@@ -788,6 +788,14 @@ fn build_vector_params(
     params_json: Option<&str>,
 ) -> FfiResult<VectorIndexParams> {
     let options: VectorIndexOptions = match params_json {
+        // serde also fills a struct from a JSON array, by field position, so
+        // only an object names its options.
+        Some(json) if !json.trim_start().starts_with('{') => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                format!("{index_type} options must be a JSON object"),
+            ))
+        }
         Some(json) => serde_json::from_str(json).map_err(|err| {
             FfiError::new(
                 ErrorCode::DatasetCreateIndex,
@@ -1105,10 +1113,17 @@ mod tests {
                 r#"{"num_bits":300}"#,
                 "invalid value: integer `300`, expected u8",
             ),
+            ("IVF_FLAT", "5", "IVF_FLAT options must be a JSON object"),
+            ("IVF_FLAT", "[]", "IVF_FLAT options must be a JSON object"),
             (
                 "IVF_FLAT",
-                "5",
-                "IVF_FLAT options: invalid type: integer `5`",
+                r#"["cosine", "v3", 1]"#,
+                "IVF_FLAT options must be a JSON object",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"metric_type":"cosine","metric_type":"l2"}"#,
+                "duplicate field `metric_type`",
             ),
         ] {
             let err = build_vector_params(index_type, Some(json)).unwrap_err();

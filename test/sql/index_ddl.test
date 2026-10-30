@@ -89,6 +89,13 @@ USING IVF_FLAT WITH (num_partitions='1', metric_type='cosine');
 ----
 invalid type: string "1", expected usize
 
+# A JSON array would otherwise fill the options by position.
+statement error
+CREATE INDEX bad_params_array_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (params='["cosine", "v3", 1]');
+----
+IVF_FLAT options must be a JSON object
+
 query TTTIT
 SHOW INDEXES ON '{TEST_DIR}/index_ddl_options.lance';
 ----
