@@ -516,6 +516,12 @@ DELETE FROM ns.main.my_table; -- delete all rows
 DETACH ns;
 ```
 
+DELETEs of different rows both commit, in one transaction or in concurrent connections, even when
+the rows share a fragment. `COMMIT` still fails with a retryable conflict when another writer, or
+an earlier statement of the same transaction, deleted one of the same rows or rewrote one of the
+fragments (`UPDATE`, `MERGE`, compaction). `COMMIT` publishes a transaction's statements one at a
+time, so the statements before the failing one stay committed.
+
 ### `MERGE INTO`
 
 `MERGE` is supported on Lance tables, including:
