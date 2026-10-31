@@ -14,6 +14,8 @@ use arrow_array::{
 };
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use lance::dataset::scanner::RowAddrTreeMap;
+use lance::dataset::transaction::Transaction;
 use lance::dataset::write::ExternalBlobMode;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -1612,10 +1614,61 @@ fn writer_finish_uncommitted_inner(
         .0;
 
     unsafe {
-        *out_transaction = Box::into_raw(txn) as *mut c_void;
+        *out_transaction = UncommittedTransaction::new(*txn).into_raw();
     }
 
     Ok(())
+}
+
+/// A staged Lance transaction that DuckDB's transaction commits or frees.
+/// `affected_rows` holds the row addresses a DELETE removes: Lance needs them
+/// to rebase the commit over a concurrent delete of other rows in the same
+/// fragments, as for its own staged deletes (`UncommittedDelete`).
+pub(super) struct UncommittedTransaction {
+    pub(super) transaction: Transaction,
+    pub(super) affected_rows: Option<RowAddrTreeMap>,
+}
+
+impl UncommittedTransaction {
+    pub(super) fn new(transaction: Transaction) -> Self {
+        Self {
+            transaction,
+            affected_rows: None,
+        }
+    }
+
+    pub(super) fn into_raw(self) -> *mut c_void {
+        Box::into_raw(Box::new(self)) as *mut c_void
+    }
+
+    /// Takes back a handle from `into_raw`.
+    ///
+    /// # Safety
+    /// `transaction` must come from `into_raw` and not have been taken yet.
+    unsafe fn from_raw(transaction: *mut c_void) -> Box<Self> {
+        unsafe { Box::from_raw(transaction as *mut Self) }
+    }
+
+    fn execute(self, builder: CommitBuilder<'_>) -> FfiResult<()> {
+        let builder = match self.affected_rows {
+            Some(affected_rows) => builder.with_affected_rows(affected_rows),
+            None => builder,
+        };
+        match runtime::block_on(builder.execute(self.transaction)) {
+            Ok(Ok(_)) => {
+                record_commit();
+                Ok(())
+            }
+            Ok(Err(err)) => Err(FfiError::new(
+                ErrorCode::DatasetCommitTransaction,
+                err.to_string(),
+            )),
+            Err(err) => Err(FfiError::new(
+                ErrorCode::DatasetCommitTransaction,
+                format!("runtime: {err}"),
+            )),
+        }
+    }
 }
 
 #[no_mangle]
@@ -1715,27 +1768,12 @@ fn commit_transaction_inner(
     }
     let session = unsafe { optional_session_handle(session)? };
 
-    let txn =
-        unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
+    let pending = unsafe { UncommittedTransaction::from_raw(transaction) };
     let mut builder = CommitBuilder::new(path.as_str()).with_store_params(store_params);
     if let Some(session) = session {
         builder = builder.with_session(session);
     }
-    let fut = builder.execute(*txn);
-    match runtime::block_on(fut) {
-        Ok(Ok(_)) => {
-            record_commit();
-            Ok(())
-        }
-        Ok(Err(err)) => Err(FfiError::new(
-            ErrorCode::DatasetCommitTransaction,
-            err.to_string(),
-        )),
-        Err(err) => Err(FfiError::new(
-            ErrorCode::DatasetCommitTransaction,
-            format!("runtime: {err}"),
-        )),
-    }
+    pending.execute(builder)
 }
 
 #[no_mangle]
@@ -1767,26 +1805,12 @@ fn commit_transaction_to_dataset_inner(
     }
     // SAFETY: the caller transfers the transaction returned by an uncommitted
     // write. Consume it even if validating the destination fails.
-    let transaction =
-        unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
+    let pending = unsafe { UncommittedTransaction::from_raw(transaction) };
     // SAFETY: the pending write retains the dataset cache entry until commit.
     let dataset = unsafe { dataset_handle(dataset)? }.dataset.clone();
     // A Dataset destination reuses its object store, base path, credentials,
     // commit handler and session, without re-resolving a mutable namespace.
-    match runtime::block_on(CommitBuilder::new(dataset).execute(*transaction)) {
-        Ok(Ok(_)) => {
-            record_commit();
-            Ok(())
-        }
-        Ok(Err(err)) => Err(FfiError::new(
-            ErrorCode::DatasetCommitTransaction,
-            err.to_string(),
-        )),
-        Err(err) => Err(FfiError::new(
-            ErrorCode::DatasetCommitTransaction,
-            format!("runtime: {err}"),
-        )),
-    }
+    pending.execute(CommitBuilder::new(dataset))
 }
 
 #[no_mangle]
@@ -1795,7 +1819,7 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
         return;
     }
     unsafe {
-        let _ = Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction);
+        let _ = UncommittedTransaction::from_raw(transaction);
     }
 }
 
