@@ -25,20 +25,22 @@ pub(crate) fn build_fts_projection(base_projection: &Arc<[String]>) -> Arc<[Stri
 }
 
 pub(crate) fn build_knn_projection(base_projection: &Arc<[String]>) -> Arc<[String]> {
-    let mut cols = Vec::with_capacity(base_projection.len() + 1);
+    let mut cols = Vec::with_capacity(base_projection.len() + 2);
     cols.extend(base_projection.iter().cloned());
     cols.push(DISTANCE_COLUMN.to_string());
+    cols.push(ROW_ID_COLUMN.to_string());
     cols.into()
 }
 
-fn append_search_metric(schema: &ArrowSchema, metric: &str) -> Arc<ArrowSchema> {
-    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
-    fields.push(Arc::new(Field::new(metric, DataType::Float32, true)));
-    Arc::new(ArrowSchema::new(fields))
-}
-
 pub(crate) fn build_knn_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
-    append_search_metric(schema, DISTANCE_COLUMN)
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(
+        DISTANCE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+    fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
+    Arc::new(ArrowSchema::new(fields))
 }
 
 pub(crate) fn build_fts_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {

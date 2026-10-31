@@ -225,9 +225,6 @@ LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
   return make_uniq<NodeStatistics>(count, count);
 }
 
-static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
-    UINT64_C(9223372036854775900);
-
 static bool LanceExpressionReferencesRowId(const LogicalGet &get,
                                            const Expression &expr) {
   bool found = false;
@@ -345,7 +342,6 @@ LanceScanGetPartitionStats(ClientContext &context,
 
 LanceScanBindData::~LanceScanBindData() {}
 
-static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
 static constexpr const char *LANCE_DEFERRED_SETTING =
     "lance_deferred_materialization";
 static constexpr const char *LANCE_NAMESPACE_QUERY_TABLE_SETTING =

@@ -584,6 +584,26 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
   return result;
 }
 
+// The index in `names` that a bound column refers to, or INVALID_INDEX. The
+// search functions list Lance's `_rowid` in `names` and bind it as the virtual
+// column LANCE_COLUMN_IDENTIFIER_ROW_ID, so that reference resolves to the
+// `_rowid` entry. Table scans do not list it and keep `_rowid` predicates for
+// their point-lookup rewrite.
+static idx_t ResolveLanceColumnId(const ColumnIndex &col_index,
+                                  const vector<string> &names) {
+  if (!col_index.IsVirtualColumn()) {
+    return col_index.GetPrimaryIndex();
+  }
+  if (col_index.GetPrimaryIndex() == LANCE_COLUMN_IDENTIFIER_ROW_ID) {
+    for (idx_t i = 0; i < names.size(); i++) {
+      if (names[i] == LANCE_ROW_ID_COLUMN_NAME) {
+        return i;
+      }
+    }
+  }
+  return DConstants::INVALID_INDEX;
+}
+
 static bool TryBuildLanceExprColumnRefIR(
     const LogicalGet &get, const vector<string> &names,
     const vector<LogicalType> &types, const vector<string> &json_columns,
@@ -609,10 +629,7 @@ static bool TryBuildLanceExprColumnRefIR(
         return false;
       }
       auto &col_index = column_ids[colref.Binding().column_index];
-      if (col_index.IsVirtualColumn()) {
-        return false;
-      }
-      auto col_id = col_index.GetPrimaryIndex();
+      auto col_id = ResolveLanceColumnId(col_index, names);
       if (col_id >= names.size() || col_id >= types.size()) {
         return false;
       }
@@ -670,10 +687,7 @@ static bool TryBuildLanceExprColumnRefIR(
         return false;
       }
       auto &col_index = column_ids[ref.Index()];
-      if (col_index.IsVirtualColumn()) {
-        return false;
-      }
-      auto col_id = col_index.GetPrimaryIndex();
+      auto col_id = ResolveLanceColumnId(col_index, names);
       if (col_id >= names.size() || col_id >= types.size()) {
         return false;
       }
