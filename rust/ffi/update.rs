@@ -30,6 +30,7 @@ use super::blob::{
 };
 
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::write::UncommittedTransaction;
 
 pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
     if !dataset.manifest.uses_stable_row_ids() {
@@ -503,8 +504,9 @@ fn update_finish_uncommitted_inner(
     unsafe {
         *out_transaction = std::ptr::null_mut();
         if let Some(txn) = maybe_txn {
-            let boxed = Box::new(txn);
-            *out_transaction = Box::into_raw(boxed) as *mut c_void;
+            // No affected rows: an update rewrites columns, and Lance would
+            // rebase affected rows as deletions.
+            *out_transaction = UncommittedTransaction::new(txn).into_raw();
         }
     }
     Ok(())

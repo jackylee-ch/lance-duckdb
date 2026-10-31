@@ -1,0 +1,187 @@
+# name: test/sql/dml_delete_concurrent.test
+# description: DELETEs of different rows in one fragment both commit, from one transaction or two connections
+# group: [sql]
+
+require lance
+
+statement ok con1
+ATTACH '{TEST_DIR}/delete_concurrent' AS del_con1 (TYPE LANCE);
+
+statement ok con2
+ATTACH '{TEST_DIR}/delete_concurrent' AS del_con2 (TYPE LANCE);
+
+# One fragment, so every statement below touches the same fragment.
+statement ok con1
+CREATE TABLE del_con1.main.t AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 13) r(i);
+
+# Each DELETE stages a transaction on the version it read, so the second one
+# is committed over the first. Lance rebases a delete over a concurrent delete
+# of other rows when the commit carries the rows it deletes.
+statement ok con1
+BEGIN;
+
+query I con1
+DELETE FROM del_con1.main.t WHERE id = 1;
+----
+1
+
+query I con1
+DELETE FROM del_con1.main.t WHERE id IN (2, 3);
+----
+2
+
+statement ok con1
+COMMIT;
+
+query T con1
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM del_con1.main.t;
+----
+4,5,6,7,8,9,10,11,12
+
+# Two connections delete different rows; the second COMMIT rebases over the first.
+statement ok con1
+BEGIN;
+
+query I con1
+DELETE FROM del_con1.main.t WHERE id = 4;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+DELETE FROM del_con2.main.t WHERE id = 5;
+----
+1
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+COMMIT;
+
+query T con2
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM del_con2.main.t;
+----
+6,7,8,9,10,11,12
+
+# A row the other connection deleted meanwhile is still a conflict.
+statement ok con1
+BEGIN;
+
+query I con1
+DELETE FROM del_con1.main.t WHERE id = 6;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+DELETE FROM del_con2.main.t WHERE id IN (6, 7);
+----
+2
+
+statement ok con1
+COMMIT;
+
+statement error con2
+COMMIT;
+----
+Retryable commit conflict
+
+# An UPDATE rewrites the fragment's data files, which Lance does not rebase a
+# DELETE over, in either commit order.
+statement ok con1
+BEGIN;
+
+query I con1
+UPDATE del_con1.main.t SET v = -8 WHERE id = 8;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+DELETE FROM del_con2.main.t WHERE id = 9;
+----
+1
+
+statement ok con1
+COMMIT;
+
+statement error con2
+COMMIT;
+----
+Retryable commit conflict
+
+statement ok con1
+BEGIN;
+
+query I con1
+UPDATE del_con1.main.t SET v = -10 WHERE id = 10;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+DELETE FROM del_con2.main.t WHERE id = 11;
+----
+1
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con2
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM del_con2.main.t;
+----
+7:7,8:-8,9:9,10:10,12:12
+
+# Deleting a row that an earlier statement of the same transaction deleted
+# conflicts at COMMIT. COMMIT publishes the statements one at a time, so the
+# ones before the conflict stay committed and the ones after it are discarded.
+statement ok con1
+CREATE TABLE del_con1.main.u AS SELECT i::BIGINT AS id FROM range(1, 6) r(i);
+
+statement ok con1
+BEGIN;
+
+query I con1
+DELETE FROM del_con1.main.u WHERE id = 1;
+----
+1
+
+query I con1
+DELETE FROM del_con1.main.u WHERE id IN (1, 2);
+----
+2
+
+query I con1
+DELETE FROM del_con1.main.u WHERE id = 3;
+----
+1
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con1
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM del_con1.main.u;
+----
+2,3,4,5
+
+statement ok con1
+DETACH del_con1;
+
+statement ok con2
+DETACH del_con2;
