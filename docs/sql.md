@@ -677,6 +677,8 @@ Notes:
   their values and ignores names it does not recognize.
 - `params = '<json object>'` supplies the complete option set, with names as written, and cannot
   be combined with other options except `replace` and `train`.
+- For optional vector parameters, JSON `null` means omission, except that
+  `hnsw_prefetch_distance: null` disables prefetching.
 - Vector indices require a fixed-size vector column. If a dataset was written with
   `FLOAT[]` / `DOUBLE[]`, first cast it with `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT[N]`
   (or `DOUBLE[N]`) and then create the index.
