@@ -282,6 +282,14 @@ Named parameters:
 
 Output:
 - Dataset columns plus `_distance` (smaller is closer).
+- `_rowid`, a virtual column as in a table scan: the row id of each hit, equal to the row id a
+  scan of the same dataset version returns (`_rowid` on a dataset path, `rowid` on an attached
+  table; the physical row address unless the dataset enables stable row ids). Select or filter it
+  by name; `SELECT *` leaves it out, so alias it to keep it in written results, for example
+  `SELECT *, _rowid AS hit_rowid`. Inside a `DELETE`, a search of the attached target table reads
+  the version the `DELETE` scans, so
+  `DELETE FROM ns.main.t WHERE rowid IN (SELECT _rowid FROM lance_fts('ns.main.t', ...))` deletes
+  the hits. This does not hold inside `UPDATE` or `MERGE` yet.
 
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
@@ -311,6 +319,7 @@ Named parameters:
 
 Output:
 - Dataset columns plus `_score` (larger is better).
+- `_rowid`, a virtual column, as for `lance_vector_search`.
 
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
@@ -356,6 +365,7 @@ Named parameters:
 
 Output:
 - Dataset columns plus `_hybrid_score` (larger is better), `_distance`, and `_score`.
+- `_rowid`, a virtual column, as for `lance_vector_search`.
 
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
@@ -515,6 +525,12 @@ DELETE FROM ns.main.my_table; -- delete all rows
 
 DETACH ns;
 ```
+
+DELETEs of different rows both commit, in one transaction or in concurrent connections, even when
+the rows share a fragment. `COMMIT` still fails with a retryable conflict when another writer, or
+an earlier statement of the same transaction, deleted one of the same rows or rewrote one of the
+fragments (`UPDATE`, `MERGE`, compaction). `COMMIT` publishes a transaction's statements one at a
+time, so the statements before the failing one stay committed.
 
 ### `MERGE INTO`
 

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use lance::dataset::scanner::RowAddrTreeMap;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::Dataset;
 use roaring::RoaringTreemap;
@@ -11,6 +12,7 @@ use crate::runtime;
 
 use super::update::{apply_deletions, build_row_id_index, lookup_row_address};
 use super::util::{dataset_handle, slice_from_ptr, FfiError, FfiResult};
+use super::write::UncommittedTransaction;
 
 // DuckDB evaluates the DELETE's WHERE clause (subqueries and joins included)
 // and streams the `_rowid` of every selected row here. The transaction is
@@ -159,7 +161,7 @@ fn delete_finish_uncommitted_inner(
 async fn row_id_delete_transaction(
     dataset: Arc<Dataset>,
     row_ids: RoaringTreemap,
-) -> Result<(Option<Transaction>, i64), String> {
+) -> Result<(Option<UncommittedTransaction>, i64), String> {
     if row_ids.is_empty() {
         return Ok((None, 0));
     }
@@ -199,6 +201,12 @@ async fn row_id_delete_transaction(
         predicate: String::new(),
     };
     let txn = Transaction::new(dataset.manifest.version, operation, None);
+    // Lance rebases the commit over concurrent deletes of other rows only
+    // when it knows the rows this delete removes.
+    let txn = UncommittedTransaction {
+        transaction: txn,
+        affected_rows: Some(RowAddrTreeMap::from(row_addrs)),
+    };
     Ok((Some(txn), deleted_rows))
 }
 
@@ -257,21 +265,30 @@ fn delete_all_uncommitted_inner(
         deleted_fragment_ids,
         predicate: "true".to_string(),
     };
+    // Removing whole fragments has no row addresses to rebase with, as for
+    // Lance's own delete of everything.
     let txn = Transaction::new(dataset.manifest.version, operation, None);
-    unsafe { write_delete_result(out_transaction, out_deleted_rows, Some(txn), deleted_rows) };
+    unsafe {
+        write_delete_result(
+            out_transaction,
+            out_deleted_rows,
+            Some(UncommittedTransaction::new(txn)),
+            deleted_rows,
+        )
+    };
     Ok(())
 }
 
 unsafe fn write_delete_result(
     out_transaction: *mut *mut c_void,
     out_deleted_rows: *mut i64,
-    txn: Option<Transaction>,
+    txn: Option<UncommittedTransaction>,
     deleted_rows: i64,
 ) {
     unsafe {
         *out_deleted_rows = deleted_rows;
         *out_transaction = match txn {
-            Some(txn) => Box::into_raw(Box::new(txn)) as *mut c_void,
+            Some(txn) => txn.into_raw(),
             None => std::ptr::null_mut(),
         };
     }
@@ -295,7 +312,7 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
-    use lance::dataset::{CommitBuilder, WriteMode, WriteParams};
+    use lance::dataset::{WriteMode, WriteParams};
 
     use crate::ffi::types::DatasetHandle;
 
@@ -353,6 +370,38 @@ mod tests {
         ids
     }
 
+    /// Stages a DELETE of `row_ids` on `dataset` through the FFI.
+    fn stage_delete(dataset: &DatasetHandle, row_ids: &[u64]) -> (*mut c_void, i64) {
+        let mut delete = std::ptr::null_mut();
+        let mut txn = std::ptr::null_mut();
+        let mut deleted_rows = 0;
+        unsafe {
+            assert_eq!(
+                lance_delete_begin(dataset as *const DatasetHandle as *mut c_void, &mut delete),
+                0
+            );
+            assert_eq!(
+                lance_delete_add_rowids(delete, row_ids.as_ptr(), row_ids.len()),
+                0
+            );
+            assert_eq!(
+                lance_delete_finish_uncommitted(delete, &mut txn, &mut deleted_rows),
+                0
+            );
+        }
+        (txn, deleted_rows)
+    }
+
+    /// Commits a staged transaction to `dataset`, as DuckDB's COMMIT does.
+    fn commit_to(dataset: &DatasetHandle, txn: *mut c_void) -> i32 {
+        unsafe {
+            crate::ffi::write::lance_commit_transaction_to_dataset(
+                dataset as *const DatasetHandle as *mut c_void,
+                txn,
+            )
+        }
+    }
+
     #[test]
     fn delete_maps_stable_row_ids_to_addresses() {
         let (uri, dataset) = write_dataset("stable", true);
@@ -379,10 +428,7 @@ mod tests {
         }
         assert_eq!(deleted_rows, 3);
 
-        let txn = unsafe { Box::from_raw(txn as *mut Transaction) };
-        runtime::block_on(CommitBuilder::new(&uri).execute(*txn))
-            .unwrap()
-            .unwrap();
+        assert_eq!(commit_to(&dataset, txn), 0);
         assert_eq!(remaining_ids(&uri), vec![0, 2, 3, 4, 7]);
     }
 
@@ -440,32 +486,75 @@ mod tests {
         .unwrap();
 
         let dataset = DatasetHandle::new(dataset);
-        let row_ids = [1_u64];
-        let mut delete = std::ptr::null_mut();
-        let mut txn = std::ptr::null_mut();
-        let mut deleted_rows = 0;
-        unsafe {
-            assert_eq!(
-                lance_delete_begin(&dataset as *const DatasetHandle as *mut c_void, &mut delete),
-                0
-            );
-            assert_eq!(
-                lance_delete_add_rowids(delete, row_ids.as_ptr(), row_ids.len()),
-                0
-            );
-            assert_eq!(
-                lance_delete_finish_uncommitted(delete, &mut txn, &mut deleted_rows),
-                0
-            );
-        }
+        let (txn, deleted_rows) = stage_delete(&dataset, &[1]);
         assert_eq!(deleted_rows, 1);
-
-        let txn = unsafe { Box::from_raw(txn as *mut Transaction) };
-        assert_eq!(txn.read_version, pinned_version);
+        let read_version = unsafe { &*(txn as *const UncommittedTransaction) }
+            .transaction
+            .read_version;
+        assert_eq!(read_version, pinned_version);
         // Lance rebases the delete over the concurrent append.
-        runtime::block_on(CommitBuilder::new(&uri).execute(*txn))
-            .unwrap()
-            .unwrap();
+        assert_eq!(commit_to(&dataset, txn), 0);
         assert_eq!(remaining_ids(&uri), vec![0, 2, 3, 4, 5, 6, 7, 100, 101]);
+    }
+
+    #[test]
+    fn delete_rebases_over_a_concurrent_delete_of_other_rows() {
+        for stable_row_ids in [false, true] {
+            let (uri, dataset) = write_dataset("concurrent", stable_row_ids);
+            let dataset = DatasetHandle::new(dataset);
+            let row_ids = |ids: &[u64]| {
+                ids.iter()
+                    .map(|id| row_id_of(*id, stable_row_ids))
+                    .collect::<Vec<_>>()
+            };
+            // All three stage on the same version, as DELETEs in one
+            // transaction or in concurrent connections do, and all touch
+            // fragment 0.
+            let (first, _) = stage_delete(&dataset, &row_ids(&[1]));
+            let (second, _) = stage_delete(&dataset, &row_ids(&[2, 5]));
+            let (overlapping, _) = stage_delete(&dataset, &row_ids(&[2, 3]));
+            assert_eq!(commit_to(&dataset, first), 0);
+            assert_eq!(commit_to(&dataset, second), 0);
+            assert_eq!(remaining_ids(&uri), vec![0, 3, 4, 6, 7]);
+
+            // Row 2 was deleted by a transaction committed meanwhile.
+            assert_eq!(commit_to(&dataset, overlapping), -1);
+            let message = last_error_message();
+            assert!(message.contains("Retryable commit conflict"), "{message}");
+            assert_eq!(remaining_ids(&uri), vec![0, 3, 4, 6, 7]);
+        }
+    }
+
+    #[test]
+    fn rebased_deletes_that_empty_a_fragment_remove_it() {
+        let (uri, dataset) = write_dataset("empty-fragment", false);
+        let dataset = DatasetHandle::new(dataset);
+        let (first, _) = stage_delete(&dataset, &[0, 1]);
+        let (second, _) = stage_delete(&dataset, &[2, 3]);
+        assert_eq!(commit_to(&dataset, first), 0);
+        assert_eq!(commit_to(&dataset, second), 0);
+        assert_eq!(remaining_ids(&uri), vec![4, 5, 6, 7]);
+        let latest = runtime::block_on(Dataset::open(&uri)).unwrap().unwrap();
+        let fragment_ids: Vec<u64> = latest.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids, vec![1]);
+    }
+
+    /// The `_rowid` DuckDB's scan returns for `id` in `write_dataset`: the
+    /// stable row id when the dataset has them, otherwise the row address.
+    fn row_id_of(id: u64, stable_row_ids: bool) -> u64 {
+        if stable_row_ids {
+            id
+        } else {
+            ((id / 4) << 32) | (id % 4)
+        }
+    }
+
+    fn last_error_message() -> String {
+        unsafe {
+            let ptr = crate::error::lance_last_error_message();
+            let text = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            crate::error::lance_free_string(ptr);
+            text
+        }
     }
 }

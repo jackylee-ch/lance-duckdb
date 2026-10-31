@@ -22,6 +22,7 @@ use super::update::{
     lookup_row_address, UpdateValueBatch,
 };
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::write::UncommittedTransaction;
 
 struct MergeHandle {
     input_schema: Arc<arrow_schema::Schema>,
@@ -582,8 +583,9 @@ fn merge_finish_uncommitted_inner(
     unsafe {
         *out_transaction = std::ptr::null_mut();
         if let Some(txn) = maybe_txn {
-            let boxed = Box::new(txn);
-            *out_transaction = Box::into_raw(boxed) as *mut c_void;
+            // No affected rows: an update rewrites columns, and Lance would
+            // rebase affected rows as deletions.
+            *out_transaction = UncommittedTransaction::new(txn).into_raw();
         }
     }
 

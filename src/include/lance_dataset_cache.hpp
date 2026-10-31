@@ -56,6 +56,8 @@ void LancePinDatasetForWrite(ClientContext &context,
 shared_ptr<LanceDatasetCacheEntry>
 LanceGetDatasetPinnedForWrite(ClientContext &context,
                               const LanceTableEntry &table);
+// Whether the current statement pinned any write target.
+bool LanceHasDatasetPinnedForWrite(ClientContext &context);
 
 void LanceInvalidateDatasetCache(ClientContext &context,
                                  const string &cache_key);
