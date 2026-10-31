@@ -40,6 +40,12 @@ static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
 static constexpr const char *LANCE_DEFAULT_DATA_STORAGE_VERSION = "2.2";
 
+// Lance's row id, which table scans and search functions expose as the
+// virtual column `_rowid`.
+static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
+    UINT64_C(9223372036854775900);
+static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
+
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);

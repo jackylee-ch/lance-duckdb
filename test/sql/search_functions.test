@@ -677,3 +677,227 @@ use memory;
 
 statement ok
 DETACH search_ns;
+
+# ===================================================================
+# _rowid is a virtual column of every search function, as in table scans:
+# it is selected and filtered by name, and SELECT * leaves it out. The
+# table has two fragments, so a row id is not a row offset.
+# ===================================================================
+
+statement ok
+ATTACH '{TEST_DIR}/search_rowid_ns' AS rowid_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE rowid_ns.main.t AS
+SELECT i::BIGINT AS id, [cos(i)::FLOAT, sin(i)::FLOAT]::FLOAT[2] AS vec, ('w' || (i % 7)) AS txt
+FROM range(0, 300) r(i);
+
+statement ok
+INSERT INTO rowid_ns.main.t
+SELECT i::BIGINT, [cos(i)::FLOAT, sin(i)::FLOAT]::FLOAT[2], ('w' || (i % 7))
+FROM range(300, 600) r(i);
+
+statement ok
+CREATE INDEX t_fts ON rowid_ns.main.t (txt) USING INVERTED;
+
+query I
+SELECT _rowid FROM '{TEST_DIR}/search_rowid_ns/t.lance' WHERE id = 301;
+----
+4294967297
+
+# Search _rowid equals the scan's _rowid, for dataset paths and for
+# namespace-backed tables.
+query II
+SELECT count(*), count(*) FILTER (WHERE s._rowid = t._rowid)
+FROM lance_vector_search('{TEST_DIR}/search_rowid_ns/t.lance', 'vec', [1.0, 0.0]::FLOAT[2], k = 100) s
+JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id);
+----
+100	100
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s._rowid = t._rowid)
+FROM lance_vector_search('rowid_ns.main.t', 'vec', [1.0, 0.0]::FLOAT[2], k = 100) s
+JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id);
+----
+100	100
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s._rowid = t._rowid)
+FROM lance_fts('rowid_ns.main.t', 'txt', 'w1', k = 100) s
+JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id);
+----
+86	86
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s._rowid = t._rowid)
+FROM lance_fts('{TEST_DIR}/search_rowid_ns/t.lance', 'txt', 'w1', k = 100) s
+JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id);
+----
+86	86
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s._rowid = t._rowid)
+FROM lance_hybrid_search('{TEST_DIR}/search_rowid_ns/t.lance', 'vec', [1.0, 0.0]::FLOAT[2], 'txt', 'w1', k = 100) s
+JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id);
+----
+100	100
+
+# A _rowid predicate reaches Lance like any other column, so prefilter = true
+# applies it before top-k.
+query I
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_rowid_ns/t.lance', 'vec', [1.0, 0.0]::FLOAT[2], k = 1, prefilter = true)
+WHERE _rowid = 4294967297;
+----
+301
+
+query I
+SELECT id FROM lance_fts('rowid_ns.main.t', 'txt', 'w0', k = 1, prefilter = true)
+WHERE _rowid = 4294967297;
+----
+301
+
+# Lance reserves the name _rowid, so results selected with * can be written
+# back only because * leaves it out; an alias keeps the row id.
+statement ok
+COPY (SELECT * FROM lance_fts('{TEST_DIR}/search_rowid_ns/t.lance', 'txt', 'w1', k = 2))
+TO '{TEST_DIR}/search_rowid_fts_hits.lance' (FORMAT lance);
+
+statement ok
+CREATE TABLE rowid_ns.main.hybrid_hits AS
+SELECT *
+FROM lance_hybrid_search('{TEST_DIR}/search_rowid_ns/t.lance', 'vec', [1.0, 0.0]::FLOAT[2], 'txt', 'w1', k = 2);
+
+statement ok
+COPY (
+  SELECT *, _rowid AS hit_rowid
+  FROM lance_vector_search('{TEST_DIR}/search_rowid_ns/t.lance', 'vec', [1.0, 0.0]::FLOAT[2], k = 2)
+) TO '{TEST_DIR}/search_rowid_knn_hits.lance' (FORMAT lance);
+
+query III
+SELECT
+  (SELECT count(*) FROM '{TEST_DIR}/search_rowid_fts_hits.lance'),
+  (SELECT count(*) FROM rowid_ns.main.hybrid_hits),
+  (SELECT count(*) FILTER (WHERE h.hit_rowid = t._rowid)
+   FROM '{TEST_DIR}/search_rowid_knn_hits.lance' h
+   JOIN '{TEST_DIR}/search_rowid_ns/t.lance' t USING (id));
+----
+2	2	2
+
+# Inside a DELETE, a namespace-backed search of the target reads the dataset
+# the DELETE pinned, as the target's own scan does, so its _rowid values
+# address the rows being deleted.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+DELETE FROM rowid_ns.main.t
+WHERE rowid IN (SELECT _rowid FROM lance_fts('rowid_ns.main.t', 'txt', 'w3', k = 100));
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Search Backend": "dataset_scan"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+DELETE FROM rowid_ns.main.t
+WHERE rowid IN (SELECT _rowid FROM lance_vector_search('rowid_ns.main.t', 'vec', [1.0, 0.0]::FLOAT[2], k = 10));
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Search Backend": "dataset_scan"[\s\S]*
+
+query II
+SELECT count(*), count(*) FILTER (WHERE txt = 'w3') FROM rowid_ns.main.t;
+----
+504	0
+
+# A prepared DELETE rebinds on every execution, so each one deletes the hits
+# of the version it scans. Hybrid search _rowid addresses the same rows.
+statement ok
+PREPARE delete_hits AS
+DELETE FROM rowid_ns.main.t
+WHERE rowid IN (SELECT _rowid FROM lance_fts('rowid_ns.main.t', 'txt', $1, k = 100));
+
+statement ok
+EXECUTE delete_hits('w4');
+
+statement ok
+EXECUTE delete_hits('w5');
+
+statement ok
+CREATE TEMP TABLE hybrid_hit_ids AS
+SELECT id
+FROM lance_hybrid_search('rowid_ns.main.t', 'vec', [1.0, 0.0]::FLOAT[2], 'txt', 'w6', k = 5);
+
+statement ok
+DELETE FROM rowid_ns.main.t
+WHERE rowid IN (
+  SELECT _rowid
+  FROM lance_hybrid_search('rowid_ns.main.t', 'vec', [1.0, 0.0]::FLOAT[2], 'txt', 'w6', k = 5)
+);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE txt IN ('w3', 'w4', 'w5')) FROM rowid_ns.main.t;
+----
+331	0
+
+query II
+SELECT (SELECT count(*) FROM hybrid_hit_ids), count(*)
+FROM rowid_ns.main.t
+WHERE id IN (SELECT id FROM hybrid_hit_ids);
+----
+5	0
+
+# The pinned dataset must match the bind schema only in the columns the search
+# reads or filters on: a UUID column stored as arrow.uuid binds as VARCHAR. A
+# filter argument is applied to the pinned dataset as query_table would apply
+# it, before top-k when prefilter = true.
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+CREATE TABLE rowid_ns.main.uuids AS
+SELECT i::BIGINT AS id, [i::FLOAT, 0.0]::FLOAT[2] AS vec, ('w' || (i % 2)) AS txt, uuid() AS u
+FROM range(8) r(i);
+
+statement ok
+RESET arrow_lossless_conversion;
+
+statement ok
+CREATE INDEX uuids_fts ON rowid_ns.main.uuids (txt) USING INVERTED;
+
+statement ok
+DELETE FROM rowid_ns.main.uuids
+WHERE id IN (SELECT id FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w1', k = 10, filter = 'id > 2'));
+
+statement ok
+DELETE FROM rowid_ns.main.uuids
+WHERE rowid IN (
+  SELECT _rowid
+  FROM lance_vector_search('rowid_ns.main.uuids', 'vec', [0.0, 0.0]::FLOAT[2], k = 2, filter = 'id > 0', prefilter = true)
+);
+
+statement error
+DELETE FROM rowid_ns.main.uuids
+WHERE u::VARCHAR IN (SELECT u FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10));
+----
+Catalog Error: lance_fts cannot read column "u" of Lance table "rowid_ns.main.uuids" as VARCHAR from the dataset this statement pinned, which stores it as UUID
+
+statement error
+DELETE FROM rowid_ns.main.uuids
+WHERE id IN (SELECT id FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10) WHERE u IS NOT NULL);
+----
+Catalog Error: lance_fts cannot read column "u" of Lance table "rowid_ns.main.uuids" as VARCHAR from the dataset this statement pinned, which stores it as UUID
+
+query I
+SELECT id FROM rowid_ns.main.uuids ORDER BY id;
+----
+0
+4
+6
+
+# A search of another table is not pinned by the DELETE.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+DELETE FROM rowid_ns.main.t
+WHERE id IN (SELECT id FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10));
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Search Backend": "namespace_query_table"[\s\S]*
+
+statement ok
+DETACH rowid_ns;

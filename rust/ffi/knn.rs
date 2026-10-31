@@ -91,6 +91,7 @@ fn get_knn_schema_inner(
         scan.refine(refine_factor_u32);
     }
     scan.use_index(use_index != 0);
+    scan.with_row_id();
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref())
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema project: {err}")))?;
@@ -186,6 +187,7 @@ fn create_knn_stream_ir_inner(
     let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
     projection_columns.push(vector_column.to_string());
     projection_columns.push(crate::constants::DISTANCE_COLUMN.to_string());
+    projection_columns.push(crate::constants::ROW_ID_COLUMN.to_string());
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -209,6 +211,7 @@ fn create_knn_stream_ir_inner(
         scan.refine(refine_factor_u32);
     }
     scan.use_index(use_index != 0);
+    scan.with_row_id();
     let filter = apply_scanner_filter(
         &mut scan,
         filter,
@@ -336,6 +339,7 @@ fn explain_knn_scan_ir_inner(
         scan.refine(refine_factor_u32);
     }
     scan.use_index(use_index != 0);
+    scan.with_row_id();
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref())
         .map_err(|err| FfiError::new(ErrorCode::ExplainPlan, format!("knn scan project: {err}")))?;

@@ -401,11 +401,13 @@ typedef struct LanceNamespaceVectorSearchOptions {
   uint64_t nprobes;
   uint64_t refine_factor;
   uint8_t use_index;
+  uint8_t with_row_id;
 } LanceNamespaceVectorSearchOptions;
 
 typedef struct LanceNamespaceFtsSearchOptions {
   const char *text_column;
   const char *query;
+  uint8_t with_row_id;
 } LanceNamespaceFtsSearchOptions;
 
 void *lance_create_namespace_vector_search_stream(

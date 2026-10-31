@@ -179,7 +179,54 @@ static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
                               "namespace-backed table: " + column);
 }
 
-static void PopulateNamespaceSearchSchema(
+// Search schemas end with `_rowid`. It stays in the bind data's names and
+// types, which index the Arrow batches, but DuckDB binds it only as the
+// virtual column LANCE_COLUMN_IDENTIFIER_ROW_ID, as for table scans: it can be
+// selected by name and `SELECT *` leaves it out. Returns its index.
+static idx_t ExposeSearchColumns(const vector<string> &result_names,
+                                 const vector<LogicalType> &result_types,
+                                 vector<Identifier> &names,
+                                 vector<LogicalType> &return_types) {
+  if (result_names.empty() || result_names.back() != LANCE_ROW_ID_COLUMN_NAME) {
+    throw InternalException("Lance search schema must end with _rowid");
+  }
+  auto rowid_index = result_names.size() - 1;
+  names.clear();
+  return_types.clear();
+  for (idx_t i = 0; i < rowid_index; i++) {
+    names.emplace_back(result_names[i]);
+    return_types.push_back(result_types[i]);
+  }
+  return rowid_index;
+}
+
+static virtual_column_map_t
+LanceSearchGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
+  virtual_column_map_t result;
+  result.emplace(LANCE_COLUMN_IDENTIFIER_ROW_ID,
+                 TableColumn(LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT));
+  return result;
+}
+
+// Replaces the virtual `_rowid` column id with its index in the bind data's
+// names. Returns whether `_rowid` is scanned.
+static bool ResolveSearchColumnIds(const vector<column_t> &column_ids,
+                                   idx_t rowid_index,
+                                   vector<column_t> &out_column_ids) {
+  bool with_row_id = false;
+  out_column_ids.clear();
+  out_column_ids.reserve(column_ids.size());
+  for (auto col_id : column_ids) {
+    if (col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID) {
+      col_id = rowid_index;
+      with_row_id = true;
+    }
+    out_column_ids.push_back(col_id);
+  }
+  return with_row_id;
+}
+
+static idx_t PopulateNamespaceSearchSchema(
     ClientContext &context, const LanceTableEntry &table,
     const string &metric_name, ArrowSchemaWrapper &schema_root,
     ArrowTableSchema &arrow_table, vector<string> &result_names,
@@ -187,14 +234,16 @@ static void PopulateNamespaceSearchSchema(
     vector<LogicalType> &return_types) {
   vector<string> field_names;
   vector<LogicalType> field_types;
-  field_names.reserve(table.GetColumns().PhysicalColumnCount() + 1);
-  field_types.reserve(table.GetColumns().PhysicalColumnCount() + 1);
+  field_names.reserve(table.GetColumns().PhysicalColumnCount() + 2);
+  field_types.reserve(table.GetColumns().PhysicalColumnCount() + 2);
   for (auto &col : table.GetColumns().Physical()) {
     field_names.push_back(col.Name().GetIdentifierName());
     field_types.push_back(col.Type());
   }
   field_names.push_back(metric_name);
   field_types.push_back(LogicalType::FLOAT);
+  field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
+  field_types.push_back(LogicalType::UBIGINT);
 
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   auto props = context.GetClientProperties();
@@ -205,10 +254,72 @@ static void PopulateNamespaceSearchSchema(
                                                schema_root.arrow_schema);
   result_names = arrow_table.GetNames();
   result_types = arrow_table.GetTypes();
-  for (const auto &name : result_names) {
-    names.emplace_back(name);
+  return ExposeSearchColumns(result_names, result_types, names, return_types);
+}
+
+// A DELETE pins its target dataset for the whole statement, and a table scan
+// of that target reads the pinned dataset. A namespace-backed search of the
+// target must do the same instead of calling query_table, which can answer
+// from a newer version or, once the namespace is repointed, from another
+// table, so its `_rowid` values would not address the rows being deleted.
+// Returns the pinned dataset, if any.
+static shared_ptr<LanceDatasetCacheEntry>
+GetSearchPinnedDataset(ClientContext &context,
+                       const LanceDatasetReference &target) {
+  // Statements without a write pin skip resolving the table again.
+  if (!target.is_table || !LanceHasDatasetPinnedForWrite(context)) {
+    return nullptr;
   }
-  return_types = result_types;
+  auto resolved = target.Resolve(context);
+  if (!resolved.table) {
+    return nullptr;
+  }
+  return LanceGetDatasetPinnedForWrite(context, *resolved.table);
+}
+
+// Builds the Arrow schema that decodes a pinned dataset's search batches. The
+// bind schema came from the catalog, so the dataset must describe the same
+// columns, and each column the search reads must have the type it was bound
+// with; anything else is an error rather than a misread. Columns it does not
+// read may differ, because the bind schema went through DuckDB's Arrow export,
+// which does not keep every type: a UUID stored as arrow.uuid binds as VARCHAR.
+static void PopulatePinnedSearchSchema(
+    ClientContext &context, void *schema_handle, const string &function_name,
+    const string &table_name, const vector<string> &names,
+    const vector<LogicalType> &types, const vector<column_t> &column_ids,
+    ArrowSchemaWrapper &schema_root, ArrowTableSchema &arrow_table) {
+  if (!schema_handle) {
+    throw IOException("Failed to get the " + function_name +
+                      " schema of the statement's pinned dataset" +
+                      LanceFormatErrorSuffix());
+  }
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  auto rc = lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema);
+  lance_free_schema(schema_handle);
+  if (rc != 0) {
+    throw IOException("Failed to export the " + function_name +
+                      " schema to Arrow C Data Interface" +
+                      LanceFormatErrorSuffix());
+  }
+  LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+                                               schema_root.arrow_schema);
+  if (arrow_table.GetNames() != names) {
+    throw CatalogException(
+        "Lance table \"%s\" was changed externally: its dataset no longer "
+        "matches the schema %s was bound with - please re-run the query.",
+        table_name, function_name);
+  }
+  auto &pinned_types = arrow_table.GetTypes();
+  for (auto col_id : column_ids) {
+    if (col_id < types.size() && pinned_types[col_id] != types[col_id]) {
+      throw CatalogException(
+          "%s cannot read column \"%s\" of Lance table \"%s\" as %s from the "
+          "dataset this statement pinned, which stores it as %s",
+          function_name, names[col_id], table_name, types[col_id].ToString(),
+          pinned_types[col_id].ToString());
+    }
+  }
 }
 
 struct LanceKnnBindData : public TableFunctionData {
@@ -224,6 +335,8 @@ struct LanceKnnBindData : public TableFunctionData {
   bool namespace_backed = false;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
+  //! The searched table, for GetSearchPinnedDataset
+  LanceDatasetReference target{string(), false};
 
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
@@ -233,6 +346,8 @@ struct LanceKnnBindData : public TableFunctionData {
   vector<string> names;
   vector<LogicalType> types;
   vector<string> json_columns;
+  //! Index of `_rowid` in names and types (see ExposeSearchColumns)
+  idx_t rowid_index = DConstants::INVALID_INDEX;
 
   vector<string> lance_pushed_filter_ir_parts;
 
@@ -250,6 +365,13 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
   bool filter_pushed_down = false;
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
+  //! Scanned column ids, with `_rowid` resolved to the bind data's index
+  vector<column_t> column_ids;
+  bool with_row_id = false;
+  //! Set when a namespace-backed search reads its statement's pinned dataset
+  shared_ptr<LanceDatasetCacheEntry> pinned_dataset;
+  ArrowSchemaWrapper pinned_schema_root;
+  ArrowTableSchema pinned_arrow_table;
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
   vector<string> namespace_columns;
@@ -528,11 +650,12 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     if (!table->HasBlobColumns()) {
       result->namespace_backed = true;
       result->namespace_config = table->NamespaceConfig();
+      result->target = target.Reference();
       result->file_path = table->DatasetUri();
-      PopulateNamespaceSearchSchema(context, *table, "_distance",
-                                    result->schema_root, result->arrow_table,
-                                    result->names, result->types, names,
-                                    return_types);
+      result->rowid_index = PopulateNamespaceSearchSchema(
+          context, *table, "_distance", result->schema_root,
+          result->arrow_table, result->names, result->types, names,
+          return_types);
       result->json_columns = table->JsonColumnNames();
       return std::move(result);
     }
@@ -582,30 +705,44 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
-  names.clear();
-  for (const auto &name : result->names) {
-    names.emplace_back(name);
-  }
-  return_types = result->types;
+  result->rowid_index =
+      ExposeSearchColumns(result->names, result->types, names, return_types);
   return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = make_uniq_base<GlobalTableFunctionState, LanceKnnGlobalState>();
   auto &global = state->Cast<LanceKnnGlobalState>();
 
+  global.with_row_id = ResolveSearchColumnIds(
+      input.column_ids, bind_data.rowid_index, global.column_ids);
+  if (bind_data.namespace_backed) {
+    global.pinned_dataset = GetSearchPinnedDataset(context, bind_data.target);
+  }
+  if (global.pinned_dataset) {
+    PopulatePinnedSearchSchema(
+        context,
+        lance_get_knn_schema(
+            global.pinned_dataset->Handle(), bind_data.vector_column.c_str(),
+            bind_data.query.data(), bind_data.query.size(), bind_data.k,
+            bind_data.nprobes, bind_data.refine_factor,
+            bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0),
+        "lance_vector_search", bind_data.target.identifier, bind_data.names,
+        bind_data.types, global.column_ids, global.pinned_schema_root,
+        global.pinned_arrow_table);
+  }
   global.projection_ids = input.projection_ids;
-  global.native_columns.reserve(input.column_ids.size());
-  for (auto col_id : input.column_ids) {
+  global.native_columns.reserve(global.column_ids.size());
+  for (auto col_id : global.column_ids) {
     if (col_id < bind_data.names.size()) {
       global.native_columns.push_back(bind_data.names[col_id]);
     }
   }
   if (!input.projection_ids.empty()) {
-    global.scanned_types.reserve(input.column_ids.size());
-    for (auto col_id : input.column_ids) {
+    global.scanned_types.reserve(global.column_ids.size());
+    for (auto col_id : global.column_ids) {
       if (col_id >= bind_data.types.size()) {
         throw IOException("Invalid column id in projection");
       }
@@ -613,8 +750,12 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
+  // Filters on `_rowid` resolve to its Lance column like any other column.
+  TableFunctionInitInput resolved_input(input.bind_data, global.column_ids,
+                                        input.projection_ids, input.filters);
   auto table_filters = BuildLanceTableFilterIRParts(
-      bind_data.names, bind_data.types, bind_data.json_columns, input, true);
+      bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
+      true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException("lance_vector_search requires filter pushdown "
                                 "for prefilterable columns when "
@@ -655,7 +796,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
 
   auto chunk = make_uniq<ArrowArrayWrapper>();
   auto result = make_uniq<LanceKnnLocalState>(std::move(chunk), context.client);
-  result->column_ids = input.column_ids;
+  result->column_ids = global.column_ids;
   result->filters = input.filters.get();
   result->global_state = &global;
   result->filter_pushed_down = global.filter_pushed_down;
@@ -663,7 +804,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
 
-  if (bind_data.namespace_backed) {
+  if (bind_data.namespace_backed && !global.pinned_dataset) {
     vector<const char *> option_key_ptrs;
     vector<const char *> option_value_ptrs;
     vector<const char *> column_ptrs;
@@ -682,6 +823,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     options.nprobes = bind_data.nprobes;
     options.refine_factor = bind_data.refine_factor;
     options.use_index = bind_data.use_index ? 1 : 0;
+    options.with_row_id = global.with_row_id ? 1 : 0;
     result->stream = CreateLanceSearchStreamWithFallback(
         global, *result, bind_data.prefilter,
         [&](const uint8_t *ir, size_t ir_len) {
@@ -696,6 +838,8 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     return std::move(result);
   }
 
+  auto *dataset = global.pinned_dataset ? global.pinned_dataset->Handle()
+                                        : bind_data.dataset;
   vector<const char *> native_column_ptrs;
   native_column_ptrs.reserve(global.native_columns.size());
   for (auto &name : global.native_columns) {
@@ -705,9 +849,9 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       global, *result, bind_data.prefilter,
       [&](const uint8_t *ir, size_t ir_len) {
         return lance_create_knn_stream_ir(
-            bind_data.dataset, bind_data.vector_column.c_str(),
-            bind_data.query.data(), bind_data.query.size(), bind_data.k,
-            bind_data.nprobes, bind_data.refine_factor,
+            dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
+            bind_data.query.size(), bind_data.k, bind_data.nprobes,
+            bind_data.refine_factor,
             native_column_ptrs.empty() ? nullptr : native_column_ptrs.data(),
             native_column_ptrs.size(), ir, ir_len,
             bind_data.namespace_filter.empty()
@@ -763,6 +907,9 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
   auto &bind_data = data.bind_data->Cast<LanceKnnBindData>();
   auto &global_state = data.global_state->Cast<LanceKnnGlobalState>();
   auto &local_state = data.local_state->Cast<LanceKnnLocalState>();
+  auto &arrow_columns = global_state.pinned_dataset
+                            ? global_state.pinned_arrow_table.GetColumns()
+                            : bind_data.arrow_table.GetColumns();
 
   while (true) {
     if (local_state.chunk_offset >=
@@ -780,8 +927,7 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
+      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
                                         local_state.all_columns, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
@@ -792,8 +938,8 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
                               global_state.projection_ids);
     } else {
       output.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(
-          local_state, bind_data.arrow_table.GetColumns(), output, false);
+      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
+                                        false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -867,10 +1013,13 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
   InsertionOrderPreservingMap<string> result;
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto &global_state = input.global_state->Cast<LanceKnnGlobalState>();
+  auto *dataset = global_state.pinned_dataset
+                      ? global_state.pinned_dataset->Handle()
+                      : bind_data.dataset;
 
   result["Lance Path"] = bind_data.file_path;
   result["Lance Search Backend"] =
-      bind_data.namespace_backed ? "namespace_query_table" : "dataset_scan";
+      dataset ? "dataset_scan" : "namespace_query_table";
   result["Lance Vector Column"] = bind_data.vector_column;
   result["Lance K"] = to_string(bind_data.k);
   result["Lance Nprobes"] = to_string(bind_data.nprobes);
@@ -899,8 +1048,11 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
       to_string(global_state.record_batch_rows.load());
   result["Lance Rows Out"] = to_string(global_state.lines_read.load());
 
-  if (bind_data.namespace_backed) {
+  // A namespace query has no local dataset handle, so there is no plan to
+  // explain, but the pushdown metrics above are still meaningful.
+  if (!dataset) {
     input.operator_metrics.SetExtraInfo(std::move(result));
+    return;
   }
 
   if (!global_state.explain_computed.load()) {
@@ -909,8 +1061,8 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
       string plan;
       string error;
       auto ok = TryLanceExplainKnn(
-          bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+          dataset, bind_data.vector_column, bind_data.query, bind_data.k,
+          bind_data.nprobes, bind_data.refine_factor,
           global_state.lance_filter_ir.empty() ? nullptr
                                                : &global_state.lance_filter_ir,
           bind_data.prefilter, bind_data.use_index, bind_data.explain_verbose,
@@ -949,6 +1101,7 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
     fun.pushdown_complex_filter = LancePushdownComplexFilter;
+    fun.get_virtual_columns = LanceSearchGetVirtualColumns;
     fun.to_string = LanceKnnToString;
     fun.get_metrics = LanceKnnGetMetrics;
   };
@@ -982,6 +1135,8 @@ struct LanceSearchBindData : public TableFunctionData {
   bool namespace_backed = false;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
+  //! The searched table, for GetSearchPinnedDataset
+  LanceDatasetReference target{string(), false};
 
   // FTS mode
   string text_column;
@@ -1007,6 +1162,8 @@ struct LanceSearchBindData : public TableFunctionData {
   vector<string> names;
   vector<LogicalType> types;
   vector<string> json_columns;
+  //! Index of `_rowid` in names and types (see ExposeSearchColumns)
+  idx_t rowid_index = DConstants::INVALID_INDEX;
 
   vector<string> lance_pushed_filter_ir_parts;
 
@@ -1024,6 +1181,13 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   bool filter_pushed_down = false;
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
+  //! Scanned column ids, with `_rowid` resolved to the bind data's index
+  vector<column_t> column_ids;
+  bool with_row_id = false;
+  //! Set when a namespace-backed search reads its statement's pinned dataset
+  shared_ptr<LanceDatasetCacheEntry> pinned_dataset;
+  ArrowSchemaWrapper pinned_schema_root;
+  ArrowTableSchema pinned_arrow_table;
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
   vector<string> namespace_columns;
@@ -1056,7 +1220,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                                      const LanceSearchBindData &bind_data,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
-    if (bind_data.namespace_backed) {
+    if (bind_data.namespace_backed && !global.pinned_dataset) {
       vector<const char *> option_key_ptrs;
       vector<const char *> option_value_ptrs;
       vector<const char *> column_ptrs;
@@ -1070,6 +1234,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
+      options.with_row_id = global.with_row_id ? 1 : 0;
       local_state.stream = CreateLanceSearchStreamWithFallback(
           global, local_state, bind_data.prefilter,
           [&](const uint8_t *ir, size_t ir_len) {
@@ -1081,6 +1246,8 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                           LanceFormatErrorSuffix());
       }
     } else {
+      auto *dataset = global.pinned_dataset ? global.pinned_dataset->Handle()
+                                            : bind_data.dataset;
       vector<const char *> native_column_ptrs;
       native_column_ptrs.reserve(global.native_columns.size());
       for (auto &name : global.native_columns) {
@@ -1091,7 +1258,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
           [&](const uint8_t *ir, size_t ir_len) -> void * {
             if (bind_data.mode == LanceSearchMode::Fts) {
               return lance_create_fts_stream_ir(
-                  bind_data.dataset, bind_data.text_column.c_str(),
+                  dataset, bind_data.text_column.c_str(),
                   bind_data.query.c_str(), bind_data.k,
                   native_column_ptrs.empty() ? nullptr
                                              : native_column_ptrs.data(),
@@ -1102,7 +1269,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                   bind_data.prefilter ? 1 : 0);
             }
             return lance_create_hybrid_stream_ir(
-                bind_data.dataset, bind_data.vector_column.c_str(),
+                dataset, bind_data.vector_column.c_str(),
                 bind_data.vector_query.data(), bind_data.vector_query.size(),
                 bind_data.text_column.c_str(), bind_data.text_query.c_str(),
                 bind_data.k, bind_data.nprobes, bind_data.refine_factor,
@@ -1196,8 +1363,9 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     if (!table->HasBlobColumns()) {
       result->namespace_backed = true;
       result->namespace_config = table->NamespaceConfig();
+      result->target = target.Reference();
       result->file_path = table->DatasetUri();
-      PopulateNamespaceSearchSchema(
+      result->rowid_index = PopulateNamespaceSearchSchema(
           context, *table, "_score", result->schema_root, result->arrow_table,
           result->names, result->types, names, return_types);
       result->json_columns = table->JsonColumnNames();
@@ -1248,11 +1416,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
-  names.clear();
-  for (const auto &name : result->names) {
-    names.emplace_back(name);
-  }
-  return_types = result->types;
+  result->rowid_index =
+      ExposeSearchColumns(result->names, result->types, names, return_types);
   return std::move(result);
 }
 
@@ -1401,11 +1566,8 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
-  names.clear();
-  for (const auto &name : result->names) {
-    names.emplace_back(name);
-  }
-  return_types = result->types;
+  result->rowid_index =
+      ExposeSearchColumns(result->names, result->types, names, return_types);
   return std::move(result);
 }
 
@@ -1433,22 +1595,40 @@ LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state =
       make_uniq_base<GlobalTableFunctionState, LanceSearchGlobalState>();
   auto &global = state->Cast<LanceSearchGlobalState>();
 
+  global.with_row_id = ResolveSearchColumnIds(
+      input.column_ids, bind_data.rowid_index, global.column_ids);
+  // Only lance_fts queries namespace-backed tables through the namespace;
+  // lance_hybrid_search opens them at bind through the statement's dataset
+  // cache, as a native table scan does.
+  if (bind_data.namespace_backed) {
+    global.pinned_dataset = GetSearchPinnedDataset(context, bind_data.target);
+  }
+  if (global.pinned_dataset) {
+    PopulatePinnedSearchSchema(
+        context,
+        lance_get_fts_schema(
+            global.pinned_dataset->Handle(), bind_data.text_column.c_str(),
+            bind_data.query.c_str(), bind_data.k, bind_data.prefilter ? 1 : 0),
+        "lance_fts", bind_data.target.identifier, bind_data.names,
+        bind_data.types, global.column_ids, global.pinned_schema_root,
+        global.pinned_arrow_table);
+  }
   global.projection_ids = input.projection_ids;
-  global.native_columns.reserve(input.column_ids.size());
-  for (auto col_id : input.column_ids) {
+  global.native_columns.reserve(global.column_ids.size());
+  for (auto col_id : global.column_ids) {
     if (col_id < bind_data.names.size()) {
       global.native_columns.push_back(bind_data.names[col_id]);
     }
   }
   if (!input.projection_ids.empty()) {
-    global.scanned_types.reserve(input.column_ids.size());
-    for (auto col_id : input.column_ids) {
+    global.scanned_types.reserve(global.column_ids.size());
+    for (auto col_id : global.column_ids) {
       if (col_id >= bind_data.types.size()) {
         throw IOException("Invalid column id in projection");
       }
@@ -1456,8 +1636,12 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
+  // Filters on `_rowid` resolve to its Lance column like any other column.
+  TableFunctionInitInput resolved_input(input.bind_data, global.column_ids,
+                                        input.projection_ids, input.filters);
   auto table_filters = BuildLanceTableFilterIRParts(
-      bind_data.names, bind_data.types, bind_data.json_columns, input, true);
+      bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
+      true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"
@@ -1501,7 +1685,7 @@ LanceSearchLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   auto chunk = make_uniq<ArrowArrayWrapper>();
   auto result =
       make_uniq<LanceSearchLocalState>(std::move(chunk), context.client);
-  result->column_ids = input.column_ids;
+  result->column_ids = global.column_ids;
   result->filters = input.filters.get();
   result->global_state = &global;
   result->filter_pushed_down = global.filter_pushed_down;
@@ -1520,6 +1704,9 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
   auto &bind_data = data.bind_data->Cast<LanceSearchBindData>();
   auto &global_state = data.global_state->Cast<LanceSearchGlobalState>();
   auto &local_state = data.local_state->Cast<LanceSearchLocalState>();
+  auto &arrow_columns = global_state.pinned_dataset
+                            ? global_state.pinned_arrow_table.GetColumns()
+                            : bind_data.arrow_table.GetColumns();
 
   while (true) {
     if (local_state.chunk_offset >=
@@ -1538,8 +1725,7 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
+      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
                                         local_state.all_columns, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
@@ -1550,8 +1736,8 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
                               global_state.projection_ids);
     } else {
       output.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(
-          local_state, bind_data.arrow_table.GetColumns(), output, false);
+      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
+                                        false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -1613,6 +1799,9 @@ static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
   auto result = LanceSearchBindToString(bind_data);
   auto &global_state = input.global_state->Cast<LanceSearchGlobalState>();
 
+  if (global_state.pinned_dataset) {
+    result["Lance Search Backend"] = "dataset_scan";
+  }
   result["Lance Filter Pushed Down"] =
       global_state.filter_pushed_down ? "true" : "false";
   result["Lance Filter Pushdown Fallbacks"] =
@@ -1645,6 +1834,7 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
   fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
+  fts.get_virtual_columns = LanceSearchGetVirtualColumns;
   fts.to_string = LanceSearchToString;
   fts.get_metrics = LanceSearchGetMetrics;
   loader.RegisterFunction(fts);
@@ -1666,6 +1856,7 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
     fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
+    fun.get_virtual_columns = LanceSearchGetVirtualColumns;
     fun.to_string = LanceSearchToString;
     fun.get_metrics = LanceSearchGetMetrics;
   };

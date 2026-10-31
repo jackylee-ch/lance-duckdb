@@ -103,6 +103,11 @@ public:
     return entry == write_datasets.end() ? nullptr : entry->second;
   }
 
+  bool HasPinnedForWrite(idx_t query_id) {
+    lock_guard<mutex> guard(lock);
+    return write_query_id == query_id && !write_datasets.empty();
+  }
+
   void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
     entries.erase(key);
@@ -180,6 +185,13 @@ LanceGetDatasetPinnedForWrite(ClientContext &context,
   return GetOrCreateLanceDatasetCacheState(context)->GetPinnedForWrite(
       context.transaction.GetActiveQuery(),
       LanceBuildDatasetCacheKeyForTable(context, table));
+}
+
+bool LanceHasDatasetPinnedForWrite(ClientContext &context) {
+  auto state = context.registered_state->Get<LanceDatasetCacheState>(
+      LANCE_DATASET_CACHE_STATE_KEY);
+  return state &&
+         state->HasPinnedForWrite(context.transaction.GetActiveQuery());
 }
 
 static void AppendCacheKeyPart(string &key, const string &value) {

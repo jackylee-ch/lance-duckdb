@@ -4,6 +4,7 @@ use std::io::Cursor;
 use std::ptr;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use arrow::ipc::reader::{FileReader, StreamReader};
 use datafusion_expr::Expr;
 use datafusion_sql::unparser::dialect::CustomDialectBuilder;
@@ -15,6 +16,7 @@ use lance_namespace::models::{
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
 
+use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
@@ -52,12 +54,14 @@ pub struct LanceNamespaceVectorSearchOptions {
     nprobes: u64,
     refine_factor: u64,
     use_index: u8,
+    with_row_id: u8,
 }
 
 #[repr(C)]
 pub struct LanceNamespaceFtsSearchOptions {
     text_column: *const c_char,
     query: *const c_char,
+    with_row_id: u8,
 }
 
 enum NamespaceBackend {
@@ -349,10 +353,69 @@ fn execute_to_stream(
     config: ParsedNamespaceQueryConfig,
     request: QueryTableRequest,
 ) -> FfiResult<StreamHandle> {
+    let batches = execute_to_batches(config, request)?;
+    Ok(StreamHandle::Batches(batches.into_iter()))
+}
+
+fn execute_to_batches(
+    config: ParsedNamespaceQueryConfig,
+    request: QueryTableRequest,
+) -> FfiResult<Vec<RecordBatch>> {
     let bytes = runtime::block_on(execute_query_table(config, request))
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
-    let batches = ipc_bytes_to_batches(bytes)?;
+    ipc_bytes_to_batches(bytes)
+}
+
+/// Runs a search request. The search schema ends with its metric column and
+/// then `_rowid`, while query_table places `_rowid` where the server chooses,
+/// so it is moved last.
+fn execute_search_to_stream(
+    config: ParsedNamespaceQueryConfig,
+    mut request: QueryTableRequest,
+    with_row_id: bool,
+) -> FfiResult<StreamHandle> {
+    if with_row_id {
+        request.with_row_id = Some(true);
+    }
+    let batches = execute_to_batches(config, request)?
+        .into_iter()
+        .map(|batch| move_row_id_last(batch, with_row_id))
+        .collect::<FfiResult<Vec<_>>>()?;
     Ok(StreamHandle::Batches(batches.into_iter()))
+}
+
+fn move_row_id_last(batch: RecordBatch, required: bool) -> FfiResult<RecordBatch> {
+    let schema = batch.schema();
+    let Ok(index) = schema.index_of(ROW_ID_COLUMN) else {
+        if required {
+            return Err(FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                "namespace query_table response has no _rowid column for with_row_id",
+            ));
+        }
+        return Ok(batch);
+    };
+    // The bind schema declares `_rowid` as UInt64 and DuckDB reads the buffer
+    // as that type, so any other type is rejected rather than misread.
+    let data_type = schema.field(index).data_type();
+    if required && data_type != &DataType::UInt64 {
+        return Err(FfiError::new(
+            ErrorCode::NamespaceQueryTable,
+            format!(
+                "namespace query_table response has _rowid of type {data_type}, expected UInt64"
+            ),
+        ));
+    }
+    let mut order = (0..batch.num_columns())
+        .filter(|&column| column != index)
+        .collect::<Vec<_>>();
+    order.push(index);
+    batch.project(&order).map_err(|err| {
+        FfiError::new(
+            ErrorCode::NamespaceQueryTable,
+            format!("reorder _rowid: {err}"),
+        )
+    })
 }
 
 fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
@@ -591,7 +654,7 @@ unsafe fn create_namespace_vector_search_stream_inner(
     }
     request.bypass_vector_index = Some(options.use_index == 0);
 
-    execute_to_stream(config, request)
+    execute_search_to_stream(config, request, options.with_row_id != 0)
 }
 
 #[no_mangle]
@@ -657,7 +720,7 @@ unsafe fn create_namespace_fts_search_stream_inner(
     fts_query.string_query = Some(Box::new(string_query));
     request.full_text_query = Some(Box::new(fts_query));
 
-    execute_to_stream(config, request)
+    execute_search_to_stream(config, request, options.with_row_id != 0)
 }
 
 #[cfg(test)]
@@ -715,5 +778,52 @@ mod tests {
         let config = rest_config(&["name"]);
         let error = build_namespace_scan_request(&config, None, -1, 1, false).unwrap_err();
         assert!(error.message.contains("cannot apply OFFSET without LIMIT"));
+    }
+
+    fn batch(columns: &[&str]) -> RecordBatch {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{Field, Schema};
+        let fields = columns
+            .iter()
+            .map(|name| Field::new(*name, DataType::UInt64, false))
+            .collect::<Vec<_>>();
+        let arrays = (0..columns.len() as u64)
+            .map(|value| std::sync::Arc::new(UInt64Array::from(vec![value])) as ArrayRef)
+            .collect();
+        RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays).unwrap()
+    }
+
+    fn column_names(batch: &RecordBatch) -> Vec<String> {
+        let schema = batch.schema();
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    #[test]
+    fn search_response_puts_row_id_last() {
+        let original = batch(&["id", "_rowid", "_distance"]);
+        let moved = move_row_id_last(original.clone(), true).unwrap();
+        assert_eq!(column_names(&moved), ["id", "_distance", "_rowid"]);
+        assert_eq!(moved.column(2), original.column(1));
+
+        let unchanged = move_row_id_last(batch(&["id", "_distance"]), false).unwrap();
+        assert_eq!(column_names(&unchanged), ["id", "_distance"]);
+
+        let error = move_row_id_last(batch(&["id", "_distance"]), true).unwrap_err();
+        assert!(error.message.contains("no _rowid column"));
+
+        let int32_row_id = RecordBatch::try_from_iter([(
+            "_rowid",
+            std::sync::Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let error = move_row_id_last(int32_row_id.clone(), true).unwrap_err();
+        assert!(error
+            .message
+            .contains("_rowid of type Int32, expected UInt64"));
+        assert!(move_row_id_last(int32_row_id, false).is_ok());
     }
 }
