@@ -21,11 +21,38 @@ impl<'a> TagMutation<'a> {
         let tag = unsafe { cstr_to_str(tag, "tag")? };
         lance::dataset::refs::check_valid_tag(tag).map_err(|err| version_error(err.to_string()))?;
         match unsafe { version.as_ref() } {
+            // Lance 14.0.3 re-encodes non-ASCII tag filenames while listing
+            // them. Such a tag would break version discovery and cleanup.
+            Some(_) if !tag.is_ascii() => Err(version_error(
+                "CREATE TAG requires an ASCII tag name".into(),
+            )),
             Some(&v) if v > 0 => Ok(Self::Create(tag, v)),
             Some(_) => Err(version_error("tag version must be positive".into())),
             None => Ok(Self::Drop(tag)),
         }
     }
+}
+
+async fn drop_dataset_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
+    let store = dataset.object_store(None).await?;
+    if store.is_local() {
+        // A case-insensitive volume can open another spelling of this name.
+        // Compare the stored directory entry before asking Lance to delete it.
+        let root = dataset.refs.root()?.path;
+        let path = lance::dataset::refs::tag_path(&root, tag);
+        let dir = lance::dataset::refs::base_tags_path(&root);
+        let entries = store.list_with_delimiter(Some(&dir)).await?;
+        if !entries
+            .objects
+            .iter()
+            .any(|e| e.location.filename() == path.filename())
+        {
+            return Err(lance::Error::RefNotFound {
+                message: format!("tag {tag} does not exist"),
+            });
+        }
+    }
+    dataset.tags().delete(tag).await
 }
 
 pub(super) fn tag_status(result: FfiResult<()>) -> i32 {
@@ -56,10 +83,11 @@ pub unsafe extern "C" fn lance_dataset_mutate_tag(
         let handle = unsafe { dataset_handle(dataset)? };
         let op = unsafe { TagMutation::from_ffi(tag, version)? };
         runtime::block_on(async {
-            let tags = handle.dataset.tags();
             match op {
-                TagMutation::Create(tag, version) => tags.create(tag, version as u64).await,
-                TagMutation::Drop(tag) => tags.delete(tag).await,
+                TagMutation::Create(tag, version) => {
+                    handle.dataset.tags().create(tag, version as u64).await
+                }
+                TagMutation::Drop(tag) => drop_dataset_tag(&handle.dataset, tag).await,
             }
         })
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?

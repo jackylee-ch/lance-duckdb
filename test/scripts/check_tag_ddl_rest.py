@@ -34,6 +34,10 @@ def main():
         dataset = Path(tmp) / "accessible.lance"
         shutil.copytree(ROOT / "test/data/branch_tag_fixture.lance", dataset)
         local = f"ATTACH '{tmp}' AS ns (TYPE LANCE); "
+        # Lance 14.0.3 encodes this filename when another client creates the tag.
+        tags = dataset / "_refs" / "tags"
+        shutil.copyfile(tags / "main_tag.json", tags / "%C3%A9.json")
+        sql(local + "ALTER TABLE ns.main.accessible DROP TAG 'é'")
         sql(local + "ALTER TABLE ns.main.accessible DROP TAG 'dev_tag'")
         assert sql(f"SELECT tag FROM lance_tags('{dataset}')") == "main_tag"
         assert sql(f"SELECT max(version) FROM lance_versions('{dataset}')") == "3"

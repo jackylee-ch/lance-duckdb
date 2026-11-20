@@ -28,6 +28,22 @@ ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'Release-2' AT VERSION 2;
 already exists
 
 statement error
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'RELEASE-2';
+----
+does not exist
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'é' AT VERSION 2;
+----
+ASCII tag name
+
+query II
+SELECT (SELECT count(*) FROM lance_versions('tag_ns.main."tag.case"')),
+       (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"') WHERE tag = 'Release-2');
+----
+2	1
+
+statement error
 ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'bad-version' AT VERSION 99;
 ----
 does not exist

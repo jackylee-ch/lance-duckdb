@@ -1013,6 +1013,6 @@ SELECT * FROM ns.main.my_table AT (VERSION => 'tag:Release-2');
 ALTER TABLE ns.main.my_table DROP TAG 'Release-2';
 ```
 
-Tag names are case-sensitive string literals. Creating a tag that already exists or dropping an unknown tag raises an error. Both operations leave the current dataset version unchanged. Dropping a tag removes its name across branches. The version remains available until ordinary cleanup removes it.
+Use the exact tag name as a string literal. New names support ASCII letters, digits, underscores, hyphens and dots, subject to Lance's naming rules. Creating a tag that already exists or dropping an unknown tag raises an error. Both operations leave the current dataset version unchanged. Dropping a tag removes its name across branches. The version remains available until ordinary cleanup removes it.
 
-Run these statements in autocommit mode. On a REST attachment the namespace service must support and authorize the tag operation. When tagging an old snapshot, coordinate with any cleanup already in progress.
+Run these statements in autocommit mode. On a REST attachment the namespace service must support and authorize the tag operation. Coordinate concurrent drops and re-creation of the same name, including case variants on case-insensitive volumes. When tagging an old snapshot, coordinate with any cleanup already in progress.
