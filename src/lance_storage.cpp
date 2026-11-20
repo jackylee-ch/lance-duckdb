@@ -52,6 +52,8 @@
 #include "lance_update.hpp"
 #include "lance_write.hpp"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 
@@ -745,37 +747,47 @@ public:
     return rest_ns.get();
   }
 
-  // A REST replacement can span CTAS pipeline threads. Reserve its name until
-  // the writer finishes or unwinds, without holding a mutex while scanning.
-  class RestTableReplacement {
+  // Reserve a physical table across CTAS threads or an in-flight tag request.
+  // Other tables remain accessible while the service completes the operation.
+  class RestTableWrite {
   public:
-    RestTableReplacement(LanceSchemaEntry &schema, Identifier name)
-        : schema(schema), name(std::move(name)) {
+    RestTableWrite(LanceSchemaEntry &schema, Identifier name,
+                   const LanceTableEntry *bound_tag_target = nullptr)
+        : schema(schema), name(std::move(name)), invalidate(!bound_tag_target) {
       lock_guard<mutex> guard(schema.table_lock);
       if (schema.namespace_dropped) {
         throw TransactionException("Lance schema changed concurrently");
       }
-      if (!schema.replacing_tables.insert(this->name).second) {
-        throw TransactionException("Lance table replacement in progress: %s",
-                                   this->name.GetIdentifierName());
+      if (bound_tag_target) {
+        schema.CheckTagTarget(*bound_tag_target);
+      }
+      if (!schema.writing_tables.insert(this->name).second) {
+        throw TransactionException(
+            "Lance table changed concurrently; retry the write on %s",
+            this->name.GetIdentifierName());
       }
     }
-    ~RestTableReplacement() {
+    ~RestTableWrite() {
       lock_guard<mutex> guard(schema.table_lock);
-      schema.tables.erase(name);
-      schema.replacing_tables.erase(name);
+      if (invalidate) {
+        schema.tables.erase(name);
+      }
+      schema.writing_tables.erase(name);
+      schema.write_finished.notify_all();
     }
+    void InvalidateOnRelease() { invalidate = true; }
 
   private:
     LanceSchemaEntry &schema;
     Identifier name;
+    bool invalidate;
   };
 
   void DropRestNamespace(ClientContext &context, bool if_exists, bool cascade) {
     lock_guard<mutex> guard(table_lock);
-    if (!replacing_tables.empty()) {
+    if (!writing_tables.empty()) {
       throw TransactionException(
-          "Lance table replacement in progress; retry DROP SCHEMA");
+          "Lance table write in progress; retry DROP SCHEMA");
     }
     vector<string> keys;
     for (const auto &entry : tables) {
@@ -801,16 +813,10 @@ public:
 
   void MutateTag(ClientContext &context, const LanceTableEntry &table,
                  const string &tag, const int64_t *version) {
-    lock_guard<mutex> guard(table_lock);
-    auto current = tables.find(table.name);
-    if (current == tables.end() || current->second.get() != &table ||
-        namespace_dropped || replacing_tables.count(table.name)) {
-      throw TransactionException(
-          "Lance table changed concurrently; retry tag operation");
-    }
     LanceInterruptScope interrupt_scope(context);
     int32_t status;
     if (rest_ns) {
+      RestTableWrite write(*this, table.name, &table);
       string bearer_token, api_key;
       rest_ns->ResolveAuth(context, bearer_token, api_key);
       auto names = ListRestNamespaceTables(
@@ -823,7 +829,7 @@ public:
           id != table.NamespaceConfig().table_id) {
         // Detailed describe can omit the physical spelling. Let a new bind
         // using the listed spelling recover without retargeting this write.
-        tables.erase(current);
+        write.InvalidateOnRelease();
         throw CatalogException(
             "Lance namespace listing does not match the "
             "bound table '%s'; retry with the listed spelling",
@@ -834,6 +840,8 @@ public:
           api_key.c_str(), rest_ns->delimiter.c_str(),
           rest_ns->headers_tsv.c_str(), tag.c_str(), version);
     } else {
+      lock_guard<mutex> guard(table_lock);
+      CheckTagTarget(table);
       auto physical = FindDirectoryNamespaceTable(
           *directory_ns, table.name.GetIdentifierName());
       if (physical != table.NamespaceConfig().table_id) {
@@ -876,7 +884,8 @@ public:
           "Lance DDL does not support explicit transactions yet");
     }
 
-    lock_guard<mutex> guard(table_lock);
+    unique_lock<mutex> guard(table_lock);
+    WaitForTableWrite(context, lance_entry->name, guard);
     auto current = tables.find(lance_entry->name);
     if (current == tables.end() || current->second.get() != lance_entry) {
       throw TransactionException(
@@ -1024,7 +1033,8 @@ public:
           "Lance table DDL does not support explicit transactions");
     }
     auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
-    lock_guard<mutex> guard(table_lock);
+    unique_lock<mutex> guard(table_lock);
+    WaitForTableWrite(context, lance_entry->name, guard);
     auto current = tables.find(lance_entry->name);
     if (current == tables.end() || current->second.get() != lance_entry) {
       throw TransactionException(
@@ -1116,11 +1126,11 @@ public:
     vector<string> option_keys;
     vector<string> option_values;
 
-    unique_ptr<RestTableReplacement> replacement;
+    unique_ptr<RestTableWrite> replacement;
     if (rest_ns) {
       if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
         replacement =
-            make_uniq<RestTableReplacement>(*this, create_info.GetTableName());
+            make_uniq<RestTableWrite>(*this, create_info.GetTableName());
       }
       unordered_map<string, Value> overrides;
       if (!rest_ns->bearer_token_override.empty()) {
@@ -1315,6 +1325,23 @@ public:
   }
 
 private:
+  // The caller holds table_lock.
+  void CheckTagTarget(const LanceTableEntry &table) const {
+    auto current = tables.find(table.name);
+    if (current == tables.end() || current->second.get() != &table) {
+      throw TransactionException(
+          "Lance table changed concurrently; retry tag operation");
+    }
+  }
+
+  void WaitForTableWrite(ClientContext &context, const Identifier &name,
+                         unique_lock<mutex> &guard) {
+    while (writing_tables.count(name)) {
+      write_finished.wait_for(guard, std::chrono::milliseconds(50));
+      context.BlockingInterruptCheck();
+    }
+  }
+
   optional_ptr<CatalogEntry>
   LookupEntryInternal(CatalogTransaction transaction,
                       const EntryLookupInfo &lookup_info,
@@ -1391,7 +1418,8 @@ private:
   unique_ptr<LanceTableGenerator> table_default_generator;
   mutex table_lock;
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
-  identifier_set_t replacing_tables;
+  identifier_set_t writing_tables;
+  std::condition_variable write_finished;
   bool namespace_dropped = false;
 };
 
@@ -1837,7 +1865,7 @@ public:
 
         struct GlobalState final : public GlobalSinkState {
           mutex lock;
-          unique_ptr<LanceSchemaEntry::RestTableReplacement> replacement;
+          unique_ptr<LanceSchemaEntry::RestTableWrite> replacement;
 
           string endpoint;
           string namespace_id;
@@ -1899,9 +1927,8 @@ public:
               data_storage_version, enable_stable_row_ids, column_names,
               column_types);
           if (writer_mode == "overwrite") {
-            state->replacement =
-                make_uniq<LanceSchemaEntry::RestTableReplacement>(
-                    schema, Identifier(table_name));
+            state->replacement = make_uniq<LanceSchemaEntry::RestTableWrite>(
+                schema, Identifier(table_name));
           }
 
           auto props = context.GetClientProperties();

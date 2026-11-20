@@ -34,10 +34,10 @@ def sql(statement, expected_error=None):
 
 
 def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, deny_drop):
-    # Two native connections must share the catalog and its schema lock.
+    # The writer, conflicting DDL and an unrelated reader share one attachment.
     suffix = "dylib" if sys.platform == "darwin" else "so"
     lib = ctypes.CDLL(str(ROOT / f"build/release/src/libduckdb.{suffix}"))
-    db, writer, dropper = (ctypes.c_void_p() for _ in range(3))
+    db, writer, dropper, reader = (ctypes.c_void_p() for _ in range(4))
 
     lib.duckdb_result_error.restype = ctypes.c_char_p
 
@@ -57,13 +57,16 @@ def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, 
     try:
         assert lib.duckdb_connect(db, ctypes.byref(writer)) == 0
         assert lib.duckdb_connect(db, ctypes.byref(dropper)) == 0
+        assert lib.duckdb_connect(db, ctypes.byref(reader)) == 0
         execute(writer, "LOAD lance; " + attach)
         table = 'ns.main."samples.v2"'
+        read_other = "SELECT count(*) FROM ns.main.other AT (VERSION => 1)"
+        execute(reader, read_other)
         # This service accepts aliases but omits the optional name in describe.
         execute(writer, 'DESCRIBE ns.main."SAMPLES.V2"')
         execute(writer, f"ALTER TABLE {table} CREATE TAG 'blocked' AT VERSION 1", "retry with the listed spelling")
         execute(writer, f"ALTER TABLE {table} CREATE TAG 'rebound' AT VERSION 1")
-        with ThreadPoolExecutor(2) as pool:
+        with ThreadPoolExecutor(3) as pool:
             for interrupt in (False, True):
                 creating.clear()
                 dropped.clear()
@@ -78,8 +81,13 @@ def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, 
                     assert creating.wait(10), "CREATE never reached the namespace"
                     if interrupt:
                         lib.duckdb_interrupt(writer)
-                    drop = pool.submit(execute, dropper, f"DROP TABLE {table}")
+                    drop = pool.submit(execute, dropper, f"DROP TABLE {table}", "Interrupt" if interrupt else None)
                     assert not dropped.wait(1), "DROP reached the namespace before the tag write completed"
+                    pool.submit(execute, reader, read_other).result(timeout=3)
+                    if interrupt:
+                        lib.duckdb_interrupt(dropper)
+                        drop.result(timeout=3)
+                        drop = pool.submit(execute, dropper, f"DROP TABLE {table}")
                 finally:
                     release.set()
                 create.result()
@@ -144,6 +152,7 @@ def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, 
         assert sql(f"SELECT tag FROM lance_tags('{path}')") == "fresh"
     finally:
         release.set()
+        lib.duckdb_disconnect(ctypes.byref(reader))
         lib.duckdb_disconnect(ctypes.byref(dropper))
         lib.duckdb_disconnect(ctypes.byref(writer))
         lib.duckdb_close(ctypes.byref(db))
@@ -305,7 +314,7 @@ def main():
                 ]:
                     for operation in ("CREATE TAG 'blocked' AT VERSION 1", "DROP TAG 'main_tag'"):
                         sql(warm + operation, expected_error=error)
-                table_pages = [["samples.v2"]]
+                table_pages = [["samples.v2", "other"]]
                 describe_table_name = False
                 concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, deny_drop)
                 assert order == ["create", "drop", "create", "drop", "drop", "drop", "cascade"], order
