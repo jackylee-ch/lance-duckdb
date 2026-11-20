@@ -152,3 +152,28 @@ statement error
 ALTER TABLE tag_ns.main."tag.case" DROP TAG 'Release-2';
 ----
 does not exist
+
+# A tag for v2 must never appear on the v1 replacement, whichever connection wins.
+concurrentloop client 0 2
+
+onlyif client=0
+statement maybe
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'old' AT VERSION 2;
+----
+<REGEX>:.*(does not exist|not found in catalog|changed concurrently).*
+
+onlyif client=1
+statement ok
+DROP TABLE tag_ns.main."tag.case";
+
+onlyif client=1
+statement ok
+CREATE TABLE tag_ns.main."tag.case" AS SELECT 33::BIGINT AS id;
+
+endloop
+
+query II
+SELECT (SELECT max(version) FROM lance_versions('tag_ns.main."tag.case"')),
+       (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"'));
+----
+1	0

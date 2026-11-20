@@ -136,10 +136,10 @@ static void LanceTagExecute(ClientContext &context, TableFunctionInput &input,
   auto &data = input.bind_data->Cast<LanceTagBindData>();
   auto target = data.table.Resolve(context);
   if (data.version.IsNull()) {
-    LanceMutateTag(context, *target.table, data.tag, nullptr);
+    target.table->MutateTag(context, data.tag, nullptr);
   } else {
     auto version = data.version.GetValue<int64_t>();
-    LanceMutateTag(context, *target.table, data.tag, &version);
+    target.table->MutateTag(context, data.tag, &version);
   }
 }
 

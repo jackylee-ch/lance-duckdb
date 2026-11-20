@@ -748,6 +748,54 @@ public:
     return keys;
   }
 
+  void MutateTag(ClientContext &context, const LanceTableEntry &table,
+                 const string &tag, const int64_t *version) {
+    lock_guard<mutex> guard(table_lock);
+    auto current = tables.find(table.name);
+    if (current == tables.end() || current->second.get() != &table) {
+      throw TransactionException(
+          "Lance table changed concurrently; retry tag operation");
+    }
+    LanceInterruptScope interrupt_scope(context);
+    int32_t status;
+    if (rest_ns) {
+      string bearer_token, api_key;
+      rest_ns->ResolveAuth(context, bearer_token, api_key);
+      auto names = ListRestNamespaceTables(
+          rest_ns->endpoint, rest_ns->namespace_id, bearer_token, api_key,
+          rest_ns->delimiter, rest_ns->headers_tsv);
+      string id;
+      if (!FindRestNamespaceTableId(rest_ns->namespace_id,
+                                    table.name.GetIdentifierName(),
+                                    rest_ns->delimiter, names, id) ||
+          id != table.NamespaceConfig().table_id) {
+        throw CatalogException("Lance namespace listing does not match the "
+                               "bound table '%s'",
+                               table.NamespaceConfig().table_id);
+      }
+      status = lance_namespace_mutate_tag(
+          rest_ns->endpoint.c_str(), id.c_str(), bearer_token.c_str(),
+          api_key.c_str(), rest_ns->delimiter.c_str(),
+          rest_ns->headers_tsv.c_str(), tag.c_str(), version);
+    } else {
+      string display_uri;
+      std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+          LanceOpenDatasetForTable(context, table, display_uri),
+          lance_close_dataset);
+      if (!dataset) {
+        context.BlockingInterruptCheck();
+        throw IOException("Failed to open Lance dataset: " + display_uri +
+                          LanceFormatErrorSuffix());
+      }
+      status = lance_dataset_mutate_tag(dataset.get(), tag.c_str(), version);
+    }
+    if (status != 0) {
+      context.BlockingInterruptCheck();
+      throw IOException(string("Failed to ") + (version ? "create" : "drop") +
+                        " Lance tag" + LanceFormatErrorSuffix());
+    }
+  }
+
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
     auto entry = GetEntry(transaction, info.GetCatalogType(),
                           info.GetQualifiedName().Name());
@@ -1413,6 +1461,12 @@ private:
   static constexpr int32_t NAMESPACE_UNSUPPORTED = 64;
   identifier_map_t<string> names;
 };
+
+void LanceTableEntry::MutateTag(ClientContext &context, const string &tag,
+                                const int64_t *version) const {
+  auto &owner = dynamic_cast<LanceSchemaEntry &>(schema);
+  owner.MutateTag(context, *this, tag, version);
+}
 
 bool LanceTryReplaceStaleTableEntry(ClientContext &context,
                                     LanceTableEntry &table) {

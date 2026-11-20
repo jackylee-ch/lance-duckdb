@@ -139,9 +139,6 @@ void FillLanceNamespaceQueryConfig(
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 
-void LanceMutateTag(ClientContext &context, const LanceTableEntry &table,
-                    const string &tag, const int64_t *version);
-
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri);

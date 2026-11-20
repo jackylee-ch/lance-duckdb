@@ -14,8 +14,8 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateTableTagRequest, CreateTableVersionRequest,
     CreateTableVersionResponse, DeclareTableRequest, DeleteTableTagRequest, DescribeTableRequest,
     DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DropNamespaceRequest, DropTableRequest, ListNamespacesRequest, ListTableVersionsRequest,
-    ListTableVersionsResponse, ListTablesRequest,
+    DropNamespaceRequest, DropTableRequest, ListNamespacesRequest, ListTableTagsRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::{LanceNamespace, NamespaceError};
@@ -295,6 +295,38 @@ fn build_namespace(connection: &NamespaceConnection) -> impl LanceNamespace {
     .build()
 }
 
+async fn delete_exact_table_tag(
+    namespace: &impl LanceNamespace,
+    id: Vec<String>,
+    tag: &str,
+) -> lance_namespace::Result<()> {
+    // A namespace can store tags on a case-insensitive filesystem. Only the
+    // list response includes the stored spelling of the tag.
+    let mut list = ListTableTagsRequest::new();
+    list.id = Some(id.clone());
+    list.limit = Some(1000);
+    let mut seen = HashSet::new();
+    loop {
+        let page = namespace.list_table_tags(list.clone()).await?;
+        if page.tags.contains_key(tag) {
+            let mut delete = DeleteTableTagRequest::new(tag.to_owned());
+            delete.id = Some(id);
+            return namespace.delete_table_tag(delete).await.map(|_| ());
+        }
+        let Some(token) = page.page_token.filter(|t| !t.is_empty()) else {
+            return Err(LanceError::RefNotFound {
+                message: format!("tag {tag} does not exist"),
+            });
+        };
+        if !seen.insert(token.clone()) {
+            return Err(LanceError::io(
+                "namespace list_table_tags: repeated page token",
+            ));
+        }
+        list.page_token = Some(token);
+    }
+}
+
 /// Change a tag through the REST namespace which owns the table.
 ///
 /// # Safety
@@ -326,19 +358,15 @@ pub unsafe extern "C" fn lance_namespace_mutate_tag(
             )?
         };
         let namespace = build_namespace(&connection);
-        let id = Some(connection.namespace_parts);
+        let id = connection.namespace_parts;
         runtime::block_on(async move {
             match op {
                 TagMutation::Create(tag, version) => {
                     let mut request = CreateTableTagRequest::new(tag.to_string(), version);
-                    request.id = id;
+                    request.id = Some(id);
                     namespace.create_table_tag(request).await.map(|_| ())
                 }
-                TagMutation::Drop(tag) => {
-                    let mut request = DeleteTableTagRequest::new(tag.to_string());
-                    request.id = id;
-                    namespace.delete_table_tag(request).await.map(|_| ())
-                }
+                TagMutation::Drop(tag) => delete_exact_table_tag(&namespace, id, tag).await,
             }
         })
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
@@ -414,6 +442,7 @@ fn list_tables_inner(
     let tables = runtime::block_on(async move {
         let mut out = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut seen = HashSet::new();
         loop {
             let mut req = ListTablesRequest::new();
             req.id = Some(namespace_parts.clone());
@@ -427,7 +456,15 @@ fn list_tables_inner(
             })?;
             out.extend(resp.tables);
             match resp.page_token {
-                Some(token) if !token.is_empty() => page_token = Some(token),
+                Some(token) if !token.is_empty() => {
+                    if !seen.insert(token.clone()) {
+                        return Err(FfiError::new(
+                            ErrorCode::NamespaceListTables,
+                            "namespace list_tables: repeated page token",
+                        ));
+                    }
+                    page_token = Some(token);
+                }
                 _ => break,
             }
         }

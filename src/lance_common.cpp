@@ -633,40 +633,6 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
   return options;
 }
 
-void LanceMutateTag(ClientContext &context, const LanceTableEntry &table,
-                    const string &tag, const int64_t *version) {
-  LanceInterruptScope interrupt_scope(context);
-  int32_t status;
-  if (table.IsNamespaceBacked() && table.NamespaceConfig().IsRest()) {
-    auto &cfg = table.NamespaceConfig();
-    auto overrides = BuildNamespaceAuthOverrideOptions(
-        cfg.bearer_token_override, cfg.api_key_override);
-    string bearer_token, api_key;
-    ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
-                              api_key);
-    status = lance_namespace_mutate_tag(
-        cfg.endpoint.c_str(), cfg.table_id.c_str(), bearer_token.c_str(),
-        api_key.c_str(), cfg.delimiter.c_str(), cfg.headers_tsv.c_str(),
-        tag.c_str(), version);
-  } else {
-    string display_uri;
-    std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
-        LanceOpenDatasetForTable(context, table, display_uri),
-        lance_close_dataset);
-    if (!dataset) {
-      context.BlockingInterruptCheck();
-      throw IOException("Failed to open Lance dataset: " + display_uri +
-                        LanceFormatErrorSuffix());
-    }
-    status = lance_dataset_mutate_tag(dataset.get(), tag.c_str(), version);
-  }
-  if (status != 0) {
-    context.BlockingInterruptCheck();
-    throw IOException(string("Failed to ") + (version ? "create" : "drop") +
-                      " Lance tag" + LanceFormatErrorSuffix());
-  }
-}
-
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri) {
