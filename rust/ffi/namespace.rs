@@ -302,7 +302,7 @@ fn tag_request_error(operation: &str, err: LanceError) -> FfiError {
     )
 }
 
-async fn delete_exact_table_tag(
+async fn verify_exact_table_tag(
     namespace: &impl LanceNamespace,
     id: Vec<String>,
     tag: &str,
@@ -310,7 +310,7 @@ async fn delete_exact_table_tag(
     // A namespace can store tags on a case-insensitive filesystem. Only the
     // list response includes the stored spelling of the tag.
     let mut list = ListTableTagsRequest::new();
-    list.id = Some(id.clone());
+    list.id = Some(id);
     list.limit = Some(1000);
     let mut seen = HashSet::new();
     loop {
@@ -321,13 +321,7 @@ async fn delete_exact_table_tag(
                 tag_request_error("cannot verify exact tag name with list_table_tags", err)
             })?;
         if page.tags.contains_key(tag) {
-            let mut delete = DeleteTableTagRequest::new(tag.to_owned());
-            delete.id = Some(id);
-            return namespace
-                .delete_table_tag(delete)
-                .await
-                .map(|_| ())
-                .map_err(|err| tag_request_error("delete_table_tag", err));
+            return Ok(());
         }
         let Some(token) = page.page_token.filter(|t| !t.is_empty()) else {
             return Err(FfiError::new(
@@ -343,6 +337,42 @@ async fn delete_exact_table_tag(
         }
         list.page_token = Some(token);
     }
+}
+
+fn mutate_namespace_tag(
+    namespace: &impl LanceNamespace,
+    id: Vec<String>,
+    op: super::versions::TagMutation<'_>,
+) -> FfiResult<()> {
+    use super::versions::TagMutation;
+    let runtime_error = |err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"));
+    if let TagMutation::Drop(tag) = op {
+        runtime::block_on(verify_exact_table_tag(namespace, id.clone(), tag))
+            .map_err(runtime_error)??;
+    }
+    runtime::block_on_tag_write(async move {
+        match op {
+            TagMutation::Create(tag, version) => {
+                let mut request = CreateTableTagRequest::new(tag.to_string(), version);
+                request.id = Some(id);
+                namespace
+                    .create_table_tag(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| tag_request_error("create_table_tag", err))
+            }
+            TagMutation::Drop(tag) => {
+                let mut request = DeleteTableTagRequest::new(tag.to_owned());
+                request.id = Some(id);
+                namespace
+                    .delete_table_tag(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| tag_request_error("delete_table_tag", err))
+            }
+        }
+    })
+    .map_err(runtime_error)?
 }
 
 /// Change a tag through the REST namespace which owns the table.
@@ -376,22 +406,7 @@ pub unsafe extern "C" fn lance_namespace_mutate_tag(
             )?
         };
         let namespace = build_namespace(&connection);
-        let id = connection.namespace_parts;
-        runtime::block_on(async move {
-            match op {
-                TagMutation::Create(tag, version) => {
-                    let mut request = CreateTableTagRequest::new(tag.to_string(), version);
-                    request.id = Some(id);
-                    namespace
-                        .create_table_tag(request)
-                        .await
-                        .map(|_| ())
-                        .map_err(|err| tag_request_error("create_table_tag", err))
-                }
-                TagMutation::Drop(tag) => delete_exact_table_tag(&namespace, id, tag).await,
-            }
-        })
-        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        mutate_namespace_tag(&namespace, connection.namespace_parts, op)
     })())
 }
 
@@ -1087,7 +1102,7 @@ fn describe_table_with_schema_inner(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
-) -> FfiResult<Option<String>> {
+) -> FfiResult<(Option<CString>, Option<CString>)> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
@@ -1105,7 +1120,7 @@ fn describe_table_with_schema_inner(
     .delimiter(delimiter.clone())
     .build();
 
-    let schema_json = runtime::block_on(async move {
+    runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
         // FIX: split the qualified id into its namespace segments (see describe_table_info_inner).
         req.id = Some(
@@ -1123,20 +1138,28 @@ fn describe_table_with_schema_inner(
             )
         })?;
 
-        let Some(schema) = resp.schema else {
-            return Ok(None);
-        };
-
-        serde_json::to_string(&schema).map(Some).map_err(|err| {
+        let schema = resp
+            .schema
+            .map(|schema| {
+                serde_json::to_string(&schema)
+                    .map(|json| to_c_string(&json))
+                    .map_err(|err| {
+                        FfiError::new(
+                            ErrorCode::SchemaExport,
+                            format!("failed to serialize schema: {err}"),
+                        )
+                    })
+            })
+            .transpose()?;
+        let table = resp.table.map(CString::new).transpose().map_err(|_| {
             FfiError::new(
-                ErrorCode::SchemaExport,
-                format!("failed to serialize schema: {err}"),
+                ErrorCode::NamespaceDescribeTable,
+                "invalid NUL in described table name",
             )
-        })
+        })?;
+        Ok((schema, table))
     })
-    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
-
-    Ok(schema_json)
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
 }
 
 #[no_mangle]
@@ -1148,10 +1171,16 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
     delimiter: *const c_char,
     headers_tsv: *const c_char,
     out_schema_json: *mut *const c_char,
+    out_table_name: *mut *const c_char,
 ) -> i32 {
     if !out_schema_json.is_null() {
         unsafe {
             std::ptr::write_unaligned(out_schema_json, ptr::null());
+        }
+    }
+    if !out_table_name.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_table_name, ptr::null());
         }
     }
 
@@ -1163,19 +1192,17 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
         delimiter,
         headers_tsv,
     ) {
-        Ok(Some(schema_json)) => {
+        Ok((schema_json, table_name)) => {
             clear_last_error();
-            if !out_schema_json.is_null() {
-                let c = CString::new(schema_json)
-                    .unwrap_or_else(|_| to_c_string("invalid schema json"));
-                unsafe {
-                    std::ptr::write_unaligned(out_schema_json, c.into_raw() as *const c_char);
+            for (out, value) in [(out_schema_json, schema_json), (out_table_name, table_name)] {
+                if !out.is_null() {
+                    if let Some(value) = value {
+                        unsafe {
+                            std::ptr::write_unaligned(out, value.into_raw());
+                        }
+                    }
                 }
             }
-            0
-        }
-        Ok(None) => {
-            clear_last_error();
             0
         }
         Err(err) => {
@@ -1743,7 +1770,7 @@ mod tests {
         let root = lance_core::utils::tempfile::TempStrDir::default();
         let uri = format!("{root}/samples.lance");
         external_write(&uri, vec![1], WriteMode::Create);
-        runtime::block_on(async {
+        let (ds, namespace, id, listed) = runtime::block_on(async {
             let ds = Dataset::open(&uri).await.unwrap();
             ds.tags().create("é", 1).await.unwrap();
             ds.tags().create("release", 1).await.unwrap();
@@ -1756,7 +1783,15 @@ mod tests {
             let mut request = ListTableTagsRequest::new();
             request.id = Some(id.clone());
             let listed = namespace.list_table_tags(request).await;
-            let dropped = delete_exact_table_tag(&namespace, id, "release").await;
+            (ds, namespace, id, listed)
+        })
+        .unwrap();
+        let dropped = mutate_namespace_tag(
+            &namespace,
+            id,
+            super::super::versions::TagMutation::Drop("release"),
+        );
+        runtime::block_on(async {
             if let Ok(page) = listed {
                 assert!(page.tags.contains_key("release"));
                 dropped.unwrap();

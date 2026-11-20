@@ -59,17 +59,31 @@ def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, 
         assert lib.duckdb_connect(db, ctypes.byref(dropper)) == 0
         execute(writer, "LOAD lance; " + attach)
         table = 'ns.main."samples.v2"'
+        # This service accepts aliases but omits the optional name in describe.
+        execute(writer, 'DESCRIBE ns.main."SAMPLES.V2"')
+        execute(writer, f"ALTER TABLE {table} CREATE TAG 'blocked' AT VERSION 1", "retry with the listed spelling")
+        execute(writer, f"ALTER TABLE {table} CREATE TAG 'rebound' AT VERSION 1")
         with ThreadPoolExecutor(2) as pool:
-            create = pool.submit(execute, writer, f"ALTER TABLE {table} CREATE TAG 'pending' AT VERSION 1")
-            try:
-                assert creating.wait(10), "CREATE never reached the namespace"
-                drop = pool.submit(execute, dropper, f"DROP TABLE {table}")
-                # An unlocked DROP can reach the server before CREATE has completed.
-                dropped.wait(1)
-            finally:
-                release.set()
-            create.result()
-            drop.result()
+            for interrupt in (False, True):
+                creating.clear()
+                dropped.clear()
+                release.clear()
+                create = pool.submit(
+                    execute,
+                    writer,
+                    f"ALTER TABLE {table} CREATE TAG 'pending' AT VERSION 1",
+                    "Interrupt" if interrupt else None,
+                )
+                try:
+                    assert creating.wait(10), "CREATE never reached the namespace"
+                    if interrupt:
+                        lib.duckdb_interrupt(writer)
+                    drop = pool.submit(execute, dropper, f"DROP TABLE {table}")
+                    assert not dropped.wait(1), "DROP reached the namespace before the tag write completed"
+                finally:
+                    release.set()
+                create.result()
+                drop.result()
 
             for definition in ("(id BIGINT)", "AS SELECT 1::BIGINT AS id"):
                 ddl = f"CREATE OR REPLACE TABLE {table} {definition}"
@@ -156,6 +170,7 @@ def main():
         location = dataset
         table_pages = [["samples.v2"]]
         tag_mode = "normal"
+        describe_table_name = True
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -192,6 +207,8 @@ def main():
                 elif "/table/" in path and path.endswith("/describe"):
                     fields = [{"name": "id", "nullable": True, "type": {"type": "int64"}}]
                     response = {"schema": {"fields": fields}, "location": str(location)}
+                    if describe_table_name:
+                        response["table"] = "samples.v2"
                 elif path == "/v1/table/Team|samples.v2/tags/list":
                     assert self.command == "POST" and query["delimiter"] == ["|"]
                     if tag_mode == "denied" and token == "next":
@@ -276,6 +293,9 @@ def main():
 
                 warm = attach + 'DESCRIBE ns.main."samples.v2"; ALTER TABLE ns.main."SAMPLES.V2" '
                 sql(warm + "CREATE TAG 'unique' AT VERSION 1")
+                alias = attach + 'DESCRIBE ns.main."SAMPLES.V2"; ALTER TABLE ns.main."SAMPLES.V2" '
+                sql(alias + "CREATE TAG 'alias' AT VERSION 1")
+                sql(alias + "DROP TAG 'Release'")
                 for table_pages, error in [
                     ([["samples.v2"], ["SAMPLES.V2"]], "Ambiguous Lance namespace table names"),
                     ([["SAMPLES.V2"]], "does not match the bound table"),
@@ -286,8 +306,9 @@ def main():
                     for operation in ("CREATE TAG 'blocked' AT VERSION 1", "DROP TAG 'main_tag'"):
                         sql(warm + operation, expected_error=error)
                 table_pages = [["samples.v2"]]
+                describe_table_name = False
                 concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, deny_drop)
-                assert order == ["create", "drop", "drop", "drop", "cascade"], order
+                assert order == ["create", "drop", "create", "drop", "drop", "drop", "cascade"], order
                 assert sql(f"SELECT tag FROM lance_tags('{dataset}')") == "main_tag"
             finally:
                 server.shutdown()
@@ -299,6 +320,10 @@ def main():
             ("create", "denied", 1),
             ("delete", "main_tag", None),
             ("create", "unique", 1),
+            ("create", "alias", 1),
+            ("delete", "Release", None),
+            ("create", "rebound", 1),
+            ("create", "pending", 1),
             ("create", "pending", 1),
             ("create", "after", 1),
             ("create", "after", 1),

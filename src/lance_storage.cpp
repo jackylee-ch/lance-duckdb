@@ -485,21 +485,24 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const Identifier &entry_name_p) override {
-    const auto &entry_name = entry_name_p.GetIdentifierName();
+    auto entry_name = entry_name_p.GetIdentifierName();
     auto table_id = AppendRestNamespaceId(namespace_id, entry_name, delimiter);
     string bearer_token;
     string api_key;
     ResolveAuth(context, bearer_token, api_key);
 
-    const char *schema_ptr = nullptr;
+    const char *schema_ptr = nullptr, *table_ptr = nullptr;
     auto rc = lance_namespace_describe_table_with_schema(
         endpoint.c_str(), table_id.c_str(),
         bearer_token.empty() ? nullptr : bearer_token.c_str(),
         api_key.empty() ? nullptr : api_key.c_str(),
         delimiter.empty() ? nullptr : delimiter.c_str(),
-        headers_tsv.empty() ? nullptr : headers_tsv.c_str(), &schema_ptr);
+        headers_tsv.empty() ? nullptr : headers_tsv.c_str(), &schema_ptr,
+        &table_ptr);
     std::unique_ptr<const char, decltype(&lance_free_string)> schema_owner(
         schema_ptr, lance_free_string);
+    std::unique_ptr<const char, decltype(&lance_free_string)> table_owner(
+        table_ptr, lance_free_string);
     if (rc != 0) {
       auto code = lance_last_error_code();
       auto error = LanceFormatErrorSuffix();
@@ -508,6 +511,10 @@ public:
       }
       throw IOException(
           "Failed to describe Lance namespace table: " + table_id + error);
+    }
+    if (table_ptr && StringUtil::CIEquals(entry_name, table_ptr)) {
+      entry_name = table_ptr;
+      table_id = AppendRestNamespaceId(namespace_id, entry_name, delimiter);
     }
     if (schema_ptr) {
       return MakeNamespaceEntry(entry_name, table_id,
@@ -814,9 +821,13 @@ public:
                                     table.name.GetIdentifierName(),
                                     rest_ns->delimiter, names, id) ||
           id != table.NamespaceConfig().table_id) {
-        throw CatalogException("Lance namespace listing does not match the "
-                               "bound table '%s'",
-                               table.NamespaceConfig().table_id);
+        // Detailed describe can omit the physical spelling. Let a new bind
+        // using the listed spelling recover without retargeting this write.
+        tables.erase(current);
+        throw CatalogException(
+            "Lance namespace listing does not match the "
+            "bound table '%s'; retry with the listed spelling",
+            table.NamespaceConfig().table_id);
       }
       status = lance_namespace_mutate_tag(
           rest_ns->endpoint.c_str(), id.c_str(), bearer_token.c_str(),

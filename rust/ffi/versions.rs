@@ -82,7 +82,7 @@ pub unsafe extern "C" fn lance_dataset_mutate_tag(
     tag_status((|| {
         let handle = unsafe { dataset_handle(dataset)? };
         let op = unsafe { TagMutation::from_ffi(tag, version)? };
-        runtime::block_on(async {
+        runtime::block_on_tag_write(async {
             match op {
                 TagMutation::Create(tag, version) => {
                     handle.dataset.tags().create(tag, version as u64).await

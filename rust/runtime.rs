@@ -63,6 +63,16 @@ pub fn handle() -> Result<Handle, io::Error> {
     Ok(runtime()?.handle().clone())
 }
 
+/// A dispatched write can outlive a dropped future. Keep the caller's table
+/// lock until the storage or namespace operation returns.
+pub fn block_on_tag_write<F: Future>(future: F) -> Result<F::Output, io::Error> {
+    let rt = runtime()?;
+    if interrupt_hook().is_some_and(|hook| hook.interrupted()) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+    }
+    Ok(rt.block_on(future))
+}
+
 /// Runs `future` to completion on the shared runtime.
 ///
 /// When the calling thread has an interrupt hook, check it before every poll of the future.

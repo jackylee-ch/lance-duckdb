@@ -1017,4 +1017,8 @@ Use the exact tag name as a string literal. New names support ASCII letters, dig
 
 Run these statements in autocommit mode. A tag write requires an unambiguous table name. REST attachments require permission to list tables and perform the tag operation. DROP also requires permission to list tags so it can check the stored spelling. If the table is being replaced, retry after checking the replacement's version. Coordinate table replacement and tag re-creation across attachments or external clients, including case variants on case-insensitive volumes. When tagging an old snapshot, coordinate with any cleanup already in progress.
 
+If DESCRIBE omitted the physical table name and the cached spelling disagrees with the namespace listing, the write fails. Check the listed table and its version, then retry with that exact spelling.
+
+Interrupting a statement after it sends the tag request can still leave the tag change in effect. The connection waits for the in-flight operation before allowing the table to be replaced. If the connection to the service fails, check the outcome with the namespace before retrying or replacing the table.
+
 A Lance 14.0.3 directory namespace served over REST can fail to list tags when the table already has a non-ASCII tag. This blocks all SQL tag deletions on that table, including ASCII tags, until the service can return their exact names. The SQL error includes the namespace's listing failure.
