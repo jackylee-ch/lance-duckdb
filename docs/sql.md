@@ -1004,3 +1004,15 @@ SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_
 - `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
 - `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
 - Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.
+
+To publish a snapshot, create a tag at an existing version of an attached Lance table:
+
+```sql
+ALTER TABLE ns.main.my_table CREATE TAG 'Release-2' AT VERSION 7;
+SELECT * FROM ns.main.my_table AT (VERSION => 'tag:Release-2');
+ALTER TABLE ns.main.my_table DROP TAG 'Release-2';
+```
+
+Tag names are case-sensitive string literals. Creating a tag that already exists or dropping an unknown tag raises an error. Both operations leave the current dataset version unchanged. Dropping a tag removes its name across branches. The version remains available until ordinary cleanup removes it.
+
+Run these statements in autocommit mode. On a REST attachment the namespace service must support and authorize the tag operation. When tagging an old snapshot, coordinate with any cleanup already in progress.

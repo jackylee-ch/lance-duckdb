@@ -4,10 +4,67 @@ use std::ffi::{c_char, c_void};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::util::{to_c_string, FfiError, FfiResult};
+use super::util::{cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult};
 
 fn version_error(message: String) -> FfiError {
     FfiError::new(ErrorCode::DatasetVersions, message)
+}
+
+pub(super) enum TagMutation<'a> {
+    Create(&'a str, i64),
+    Drop(&'a str),
+}
+
+impl<'a> TagMutation<'a> {
+    /// The caller keeps the C string and optional version alive for the call.
+    pub(super) unsafe fn from_ffi(tag: *const c_char, version: *const i64) -> FfiResult<Self> {
+        let tag = unsafe { cstr_to_str(tag, "tag")? };
+        lance::dataset::refs::check_valid_tag(tag).map_err(|err| version_error(err.to_string()))?;
+        match unsafe { version.as_ref() } {
+            Some(&v) if v > 0 => Ok(Self::Create(tag, v)),
+            Some(_) => Err(version_error("tag version must be positive".into())),
+            None => Ok(Self::Drop(tag)),
+        }
+    }
+}
+
+pub(super) fn tag_status(result: FfiResult<()>) -> i32 {
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+/// Create a tag at the supplied version, or delete it when version is null.
+///
+/// # Safety
+/// The dataset handle, NUL-terminated tag and optional version must be valid
+/// for this call.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_mutate_tag(
+    dataset: *mut c_void,
+    tag: *const c_char,
+    version: *const i64,
+) -> i32 {
+    tag_status((|| {
+        let handle = unsafe { dataset_handle(dataset)? };
+        let op = unsafe { TagMutation::from_ffi(tag, version)? };
+        runtime::block_on(async {
+            let tags = handle.dataset.tags();
+            match op {
+                TagMutation::Create(tag, version) => tags.create(tag, version as u64).await,
+                TagMutation::Drop(tag) => tags.delete(tag).await,
+            }
+        })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        .map_err(|err| version_error(err.to_string()))
+    })())
 }
 
 /// The branch a dataset handle or tag belongs to; `None` is the main branch.

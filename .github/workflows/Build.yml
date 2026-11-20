@@ -68,6 +68,9 @@ jobs:
       - name: Check AT TIMESTAMP dataset identity
         run: python3 test/scripts/check_time_travel_at_rest.py
 
+      - name: Check REST namespace tag writes
+        run: python3 test/scripts/check_tag_ddl_rest.py
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:

@@ -11,10 +11,11 @@ use lance::Dataset;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
-    CreateNamespaceRequest, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DropNamespaceRequest, DropTableRequest, ListNamespacesRequest,
-    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
+    CreateNamespaceRequest, CreateTableTagRequest, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeclareTableRequest, DeleteTableTagRequest, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DropNamespaceRequest, DropTableRequest, ListNamespacesRequest, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::{LanceNamespace, NamespaceError};
@@ -292,6 +293,62 @@ fn build_namespace(connection: &NamespaceConnection) -> impl LanceNamespace {
     )
     .delimiter(connection.delimiter.clone())
     .build()
+}
+
+/// Change a tag through the REST namespace which owns the table.
+///
+/// # Safety
+/// All strings must be valid NUL-terminated strings or null for optional
+/// arguments. A non-null version must point to a live i64.
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_mutate_tag(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    tag: *const c_char,
+    version: *const i64,
+) -> i32 {
+    use super::versions::{tag_status, TagMutation};
+
+    tag_status((|| {
+        let op = unsafe { TagMutation::from_ffi(tag, version)? };
+        let connection = unsafe {
+            parse_namespace_connection(
+                endpoint,
+                table_id,
+                bearer_token,
+                api_key,
+                delimiter,
+                headers_tsv,
+            )?
+        };
+        let namespace = build_namespace(&connection);
+        let id = Some(connection.namespace_parts);
+        runtime::block_on(async move {
+            match op {
+                TagMutation::Create(tag, version) => {
+                    let mut request = CreateTableTagRequest::new(tag.to_string(), version);
+                    request.id = id;
+                    namespace.create_table_tag(request).await.map(|_| ())
+                }
+                TagMutation::Drop(tag) => {
+                    let mut request = DeleteTableTagRequest::new(tag.to_string());
+                    request.id = id;
+                    namespace.delete_table_tag(request).await.map(|_| ())
+                }
+            }
+        })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        .map_err(|err| {
+            FfiError::new(
+                namespace_error_code(&err, ErrorCode::DatasetVersions),
+                err.to_string(),
+            )
+        })
+    })())
 }
 
 fn normalize_listed_tables(
