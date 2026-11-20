@@ -33,7 +33,7 @@ def sql(statement, expected_error=None):
     return result.stdout.strip()
 
 
-def concurrent_table_ddl(attach, creating, dropped, release, release_drop, deny_drop):
+def concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, deny_drop):
     # Two native connections must share the catalog and its schema lock.
     suffix = "dylib" if sys.platform == "darwin" else "so"
     lib = ctypes.CDLL(str(ROOT / f"build/release/src/libduckdb.{suffix}"))
@@ -88,6 +88,46 @@ def concurrent_table_ddl(attach, creating, dropped, release, release_drop, deny_
                 finally:
                     deny_drop.clear()
                 execute(writer, f"ALTER TABLE {table} CREATE TAG 'after' AT VERSION 1")
+
+            creating.clear()
+            dropped.clear()
+            release_drop.clear()
+            child = 'ns.Child."samples.v2"'
+            execute(writer, f"DESCRIBE {child}")
+            drop = pool.submit(execute, dropper, "DROP SCHEMA ns.Child CASCADE")
+            try:
+                assert dropped.wait(10), "CASCADE never reached the namespace"
+                create = pool.submit(
+                    execute, writer, f"ALTER TABLE {child} CREATE TAG 'stale' AT VERSION 1", "does not exist"
+                )
+                assert not creating.wait(1), "a tag request reached the namespace during CASCADE"
+            finally:
+                release_drop.set()
+            drop.result()
+            create.result()
+
+        execute(writer, f"ATTACH '{tmp}' AS local_ns (TYPE LANCE)")
+        bound = "local_ns.main.bound"
+        execute(writer, f"CREATE TABLE {bound} AS SELECT 11::BIGINT AS id")
+        execute(writer, "SET threads = 1")
+        statement, pending = ctypes.c_void_p(), ctypes.c_void_p()
+        result = Result()
+        try:
+            tag_sql = f"ALTER TABLE {bound} CREATE TAG 'stale' AT VERSION 1".encode()
+            assert lib.duckdb_prepare(writer, tag_sql, ctypes.byref(statement)) == 0
+            assert lib.duckdb_pending_prepared(statement, ctypes.byref(pending)) == 0
+            execute(dropper, f"DROP TABLE {bound}; CREATE TABLE {bound} AS SELECT 99::BIGINT AS id")
+            status = lib.duckdb_execute_pending(pending, ctypes.byref(result))
+            message = lib.duckdb_result_error(ctypes.byref(result))
+            assert status and b"changed concurrently" in (message or b""), message
+        finally:
+            lib.duckdb_destroy_result(ctypes.byref(result))
+            lib.duckdb_destroy_pending(ctypes.byref(pending))
+            lib.duckdb_destroy_prepare(ctypes.byref(statement))
+        path = Path(tmp) / "bound.lance"
+        assert sql(f"SELECT count(*) FROM lance_tags('{path}')") == "0"
+        execute(writer, f"ALTER TABLE {bound} CREATE TAG 'fresh' AT VERSION 1")
+        assert sql(f"SELECT tag FROM lance_tags('{path}')") == "fresh"
     finally:
         release.set()
         lib.duckdb_disconnect(ctypes.byref(dropper))
@@ -143,6 +183,10 @@ def main():
                         response = {"tables": table_pages[1 if token == "next" else 0]}
                         if len(table_pages) == 2 and token is None:
                             response["page_token"] = "next"
+                elif path == "/v1/namespace/Team/list":
+                    response = {"namespaces": ["Child"]}
+                elif path == "/v1/namespace/Team|Child/table/list":
+                    response = {"tables": ["samples.v2"]}
                 elif "/namespace/" in path and path.endswith("/list"):
                     response = {"namespaces": []}
                 elif "/table/" in path and path.endswith("/describe"):
@@ -152,6 +196,8 @@ def main():
                     assert self.command == "POST" and query["delimiter"] == ["|"]
                     if tag_mode == "denied" and token == "next":
                         status, response = 403, {"message": "tag listing denied"}
+                    elif tag_mode == "unreadable":
+                        status, response = 400, {"message": "cannot read encoded tag filename"}
                     elif tag_mode == "repeated" or token is None:
                         response = {"tags": {}, "page_token": "next"}
                     else:
@@ -159,6 +205,16 @@ def main():
                         response = {
                             "tags": {name: {"version": 1, "manifestSize": 64} for name in ("Release", "main_tag")}
                         }
+                elif path == "/v1/table/Team|Child|samples.v2/tags/create":
+                    assert json.loads(payload)["id"] == ["Team", "Child", "samples.v2"]
+                    creating.set()
+                    order.append("child tag")
+                    response = {}
+                elif path == "/v1/namespace/Team|Child/drop":
+                    dropped.set()
+                    assert release_drop.wait(10)
+                    order.append("cascade")
+                    response = {}
                 elif "/tags/" in path:
                     body = json.loads(payload)
                     assert self.command == "POST" and query["delimiter"] == ["|"]
@@ -210,7 +266,11 @@ def main():
                 sql(alter + "DROP TAG 'Release'")
                 sql(alter + "CREATE TAG 'denied' AT VERSION 1", expected_error="denied")
                 sql(alter + "DROP TAG 'main_tag'", expected_error="denied")
-                for tag_mode, error in [("denied", "tag listing denied"), ("repeated", "repeated page token")]:
+                for tag_mode, error in [
+                    ("denied", "tag listing denied"),
+                    ("repeated", "repeated page token"),
+                    ("unreadable", "cannot verify exact tag name with list_table_tags"),
+                ]:
                     sql(alter + "DROP TAG 'main_tag'", expected_error=error)
                 tag_mode = "normal"
 
@@ -226,8 +286,8 @@ def main():
                     for operation in ("CREATE TAG 'blocked' AT VERSION 1", "DROP TAG 'main_tag'"):
                         sql(warm + operation, expected_error=error)
                 table_pages = [["samples.v2"]]
-                concurrent_table_ddl(attach, creating, dropped, release, release_drop, deny_drop)
-                assert order == ["create", "drop", "drop", "drop"], order
+                concurrent_table_ddl(attach, tmp, creating, dropped, release, release_drop, deny_drop)
+                assert order == ["create", "drop", "drop", "drop", "cascade"], order
                 assert sql(f"SELECT tag FROM lance_tags('{dataset}')") == "main_tag"
             finally:
                 server.shutdown()

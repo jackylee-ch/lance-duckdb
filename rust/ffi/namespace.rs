@@ -295,11 +295,18 @@ fn build_namespace(connection: &NamespaceConnection) -> impl LanceNamespace {
     .build()
 }
 
+fn tag_request_error(operation: &str, err: LanceError) -> FfiError {
+    FfiError::new(
+        namespace_error_code(&err, ErrorCode::DatasetVersions),
+        format!("{operation}: {err}"),
+    )
+}
+
 async fn delete_exact_table_tag(
     namespace: &impl LanceNamespace,
     id: Vec<String>,
     tag: &str,
-) -> lance_namespace::Result<()> {
+) -> FfiResult<()> {
     // A namespace can store tags on a case-insensitive filesystem. Only the
     // list response includes the stored spelling of the tag.
     let mut list = ListTableTagsRequest::new();
@@ -307,19 +314,30 @@ async fn delete_exact_table_tag(
     list.limit = Some(1000);
     let mut seen = HashSet::new();
     loop {
-        let page = namespace.list_table_tags(list.clone()).await?;
+        let page = namespace
+            .list_table_tags(list.clone())
+            .await
+            .map_err(|err| {
+                tag_request_error("cannot verify exact tag name with list_table_tags", err)
+            })?;
         if page.tags.contains_key(tag) {
             let mut delete = DeleteTableTagRequest::new(tag.to_owned());
             delete.id = Some(id);
-            return namespace.delete_table_tag(delete).await.map(|_| ());
+            return namespace
+                .delete_table_tag(delete)
+                .await
+                .map(|_| ())
+                .map_err(|err| tag_request_error("delete_table_tag", err));
         }
         let Some(token) = page.page_token.filter(|t| !t.is_empty()) else {
-            return Err(LanceError::RefNotFound {
-                message: format!("tag {tag} does not exist"),
-            });
+            return Err(FfiError::new(
+                ErrorCode::DatasetVersions,
+                format!("tag {tag} does not exist"),
+            ));
         };
         if !seen.insert(token.clone()) {
-            return Err(LanceError::io(
+            return Err(FfiError::new(
+                ErrorCode::DatasetVersions,
                 "namespace list_table_tags: repeated page token",
             ));
         }
@@ -364,18 +382,16 @@ pub unsafe extern "C" fn lance_namespace_mutate_tag(
                 TagMutation::Create(tag, version) => {
                     let mut request = CreateTableTagRequest::new(tag.to_string(), version);
                     request.id = Some(id);
-                    namespace.create_table_tag(request).await.map(|_| ())
+                    namespace
+                        .create_table_tag(request)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| tag_request_error("create_table_tag", err))
                 }
                 TagMutation::Drop(tag) => delete_exact_table_tag(&namespace, id, tag).await,
             }
         })
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
-        .map_err(|err| {
-            FfiError::new(
-                namespace_error_code(&err, ErrorCode::DatasetVersions),
-                err.to_string(),
-            )
-        })
     })())
 }
 
@@ -1720,6 +1736,42 @@ mod tests {
         runtime::block_on(Dataset::write(reader, uri, Some(params)))
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn rest_tag_delete_respects_directory_namespace_listing_with_unicode() {
+        let root = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = format!("{root}/samples.lance");
+        external_write(&uri, vec![1], WriteMode::Create);
+        runtime::block_on(async {
+            let ds = Dataset::open(&uri).await.unwrap();
+            ds.tags().create("é", 1).await.unwrap();
+            ds.tags().create("release", 1).await.unwrap();
+            let namespace = lance_namespace_impls::DirectoryNamespaceBuilder::new(root.as_ref())
+                .manifest_enabled(false)
+                .build()
+                .await
+                .unwrap();
+            let id = vec!["samples".to_string()];
+            let mut request = ListTableTagsRequest::new();
+            request.id = Some(id.clone());
+            let listed = namespace.list_table_tags(request).await;
+            let dropped = delete_exact_table_tag(&namespace, id, "release").await;
+            if let Ok(page) = listed {
+                assert!(page.tags.contains_key("release"));
+                dropped.unwrap();
+                assert!(ds.tags().get("release").await.is_err());
+            } else {
+                // Lance 14.0.3 can fail to list even ASCII tags on this table.
+                assert!(dropped
+                    .unwrap_err()
+                    .message
+                    .contains("cannot verify exact tag name"));
+                assert_eq!(ds.tags().get("release").await.unwrap().version, 1);
+            }
+            assert_eq!(ds.tags().get("é").await.unwrap().version, 1);
+        })
+        .unwrap();
     }
 
     /// (endpoint, stop flag, log of raw requests) handed out by

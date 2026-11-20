@@ -95,19 +95,21 @@ LanceMaintenanceInitGlobal(ClientContext &, TableFunctionInitInput &) {
 }
 
 struct LanceTagBindData final : public FunctionData {
-  LanceTagBindData(LanceDatasetReference table_p, string tag_p, Value version_p)
-      : table(std::move(table_p)), tag(std::move(tag_p)),
+  LanceTagBindData(LanceDatasetReference table_p, idx_t oid_p, string tag_p,
+                   Value version_p)
+      : table(std::move(table_p)), oid(oid_p), tag(std::move(tag_p)),
         version(std::move(version_p)) {}
   LanceDatasetReference table;
+  idx_t oid;
   string tag;
   Value version;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceTagBindData>(table, tag, version);
+    return make_uniq<LanceTagBindData>(table, oid, tag, version);
   }
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceTagBindData>();
-    return table == other.table && tag == other.tag &&
+    return table == other.table && oid == other.oid && tag == other.tag &&
            Value::NotDistinctFrom(version, other.version);
   }
 };
@@ -120,7 +122,8 @@ static unique_ptr<FunctionData> LanceTagBind(ClientContext &,
   names = {"Success"};
   return make_uniq<LanceTagBindData>(
       LanceDatasetReference{input.inputs[0].GetValue<string>(), true},
-      input.inputs[1].GetValue<string>(), input.inputs[2]);
+      input.inputs[1].GetValue<uint64_t>(), input.inputs[2].GetValue<string>(),
+      input.inputs[3]);
 }
 
 static void LanceTagExecute(ClientContext &context, TableFunctionInput &input,
@@ -135,6 +138,10 @@ static void LanceTagExecute(ClientContext &context, TableFunctionInput &input,
   }
   auto &data = input.bind_data->Cast<LanceTagBindData>();
   auto target = data.table.Resolve(context);
+  if (target.table->oid != data.oid) {
+    throw TransactionException(
+        "Lance table changed concurrently; retry tag operation");
+  }
   if (data.version.IsNull()) {
     target.table->MutateTag(context, data.tag, nullptr);
   } else {
@@ -1412,14 +1419,15 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
       // Bind the write directly so only the ALTER statement can execute it.
       result.function = TableFunction(
           "__lance_mutate_tag",
-          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+          {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::VARCHAR,
+           LogicalType::BIGINT},
           LanceTagExecute, LanceTagBind, LanceMaintenanceInitGlobal);
       result.function.verify_serialization = false;
-      result.parameters = {Value(target), Value(parse_data->tag),
-                           parse_data->kind ==
-                                   LanceMaintenanceStmtKind::CREATE_TAG
-                               ? Value::BIGINT(parse_data->tag_version)
-                               : Value(LogicalType::BIGINT)};
+      result.parameters = {
+          Value(target), Value::UBIGINT(entry.oid), Value(parse_data->tag),
+          parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG
+              ? Value::BIGINT(parse_data->tag_version)
+              : Value(LogicalType::BIGINT)};
       return result;
     }
     auto &table = entry.Cast<TableCatalogEntry>();

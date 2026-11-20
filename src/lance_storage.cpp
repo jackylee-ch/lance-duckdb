@@ -745,6 +745,9 @@ public:
     RestTableReplacement(LanceSchemaEntry &schema, Identifier name)
         : schema(schema), name(std::move(name)) {
       lock_guard<mutex> guard(schema.table_lock);
+      if (schema.namespace_dropped) {
+        throw TransactionException("Lance schema changed concurrently");
+      }
       if (!schema.replacing_tables.insert(this->name).second) {
         throw TransactionException("Lance table replacement in progress: %s",
                                    this->name.GetIdentifierName());
@@ -761,14 +764,32 @@ public:
     Identifier name;
   };
 
-  vector<string> CachedDatasetKeys(ClientContext &context) {
+  void DropRestNamespace(ClientContext &context, bool if_exists, bool cascade) {
     lock_guard<mutex> guard(table_lock);
+    if (!replacing_tables.empty()) {
+      throw TransactionException(
+          "Lance table replacement in progress; retry DROP SCHEMA");
+    }
     vector<string> keys;
     for (const auto &entry : tables) {
       keys.push_back(LanceBuildDatasetCacheKeyForTable(
           context, entry.second->Cast<LanceTableEntry>()));
     }
-    return keys;
+    string bearer_token, api_key;
+    rest_ns->ResolveAuth(context, bearer_token, api_key);
+    if (lance_namespace_drop_namespace(
+            rest_ns->endpoint.c_str(), rest_ns->namespace_id.c_str(),
+            bearer_token.c_str(), api_key.c_str(), rest_ns->delimiter.c_str(),
+            rest_ns->headers_tsv.c_str(), if_exists, cascade) != 0) {
+      // Throwing rolls back the native schema, view and dependency tombstones.
+      throw IOException("Failed to drop Lance namespace: " +
+                        rest_ns->namespace_id + LanceFormatErrorSuffix());
+    }
+    namespace_dropped = true;
+    tables.clear();
+    for (const auto &key : keys) {
+      LanceInvalidateDatasetCache(context, key);
+    }
   }
 
   void MutateTag(ClientContext &context, const LanceTableEntry &table,
@@ -776,7 +797,7 @@ public:
     lock_guard<mutex> guard(table_lock);
     auto current = tables.find(table.name);
     if (current == tables.end() || current->second.get() != &table ||
-        replacing_tables.count(table.name)) {
+        namespace_dropped || replacing_tables.count(table.name)) {
       throw TransactionException(
           "Lance table changed concurrently; retry tag operation");
     }
@@ -1292,6 +1313,9 @@ private:
       return native;
     }
     lock_guard<mutex> guard(table_lock);
+    if (namespace_dropped) {
+      return nullptr;
+    }
     auto &name = lookup_info.GetEntryIdentifier();
     auto found = tables.find(name);
     if (!transaction.context) {
@@ -1357,6 +1381,7 @@ private:
   mutex table_lock;
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
   identifier_set_t replacing_tables;
+  bool namespace_dropped = false;
 };
 
 static bool IsProtectedLanceSchema(const Identifier &name) {
@@ -1656,8 +1681,6 @@ public:
           "DROP SCHEMA is not supported for this Lance schema");
     }
     const auto name = schema->name;
-    auto child = schema_generator->ChildConfig(name.GetIdentifierName());
-    auto keys = lance_schema->CachedDatasetKeys(context);
     if (!GetSchemaCatalogSet().DropEntry(transaction, name, info.cascade,
                                          info.allow_drop_internal)) {
       if (info.if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
@@ -1665,23 +1688,10 @@ public:
       }
       return;
     }
-    string bearer_token;
-    string api_key;
-    child->ResolveAuth(context, bearer_token, api_key);
-    auto rc = lance_namespace_drop_namespace(
-        child->endpoint.c_str(), child->namespace_id.c_str(),
-        bearer_token.c_str(), api_key.c_str(), child->delimiter.c_str(),
-        child->headers_tsv.c_str(),
-        info.if_not_found == OnEntryNotFound::RETURN_NULL, info.cascade);
-    if (rc != 0) {
-      // Throwing rolls back the native schema, view and dependency tombstones.
-      throw IOException("Failed to drop Lance namespace: " +
-                        child->namespace_id + LanceFormatErrorSuffix());
-    }
+    lance_schema->DropRestNamespace(
+        context, info.if_not_found == OnEntryNotFound::RETURN_NULL,
+        info.cascade);
     schema_generator->Forget(name);
-    for (const auto &key : keys) {
-      LanceInvalidateDatasetCache(context, key);
-    }
   }
 
   using DuckCatalog::PlanUpdate;
