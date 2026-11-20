@@ -738,6 +738,29 @@ public:
     return rest_ns.get();
   }
 
+  // A REST replacement can span CTAS pipeline threads. Reserve its name until
+  // the writer finishes or unwinds, without holding a mutex while scanning.
+  class RestTableReplacement {
+  public:
+    RestTableReplacement(LanceSchemaEntry &schema, Identifier name)
+        : schema(schema), name(std::move(name)) {
+      lock_guard<mutex> guard(schema.table_lock);
+      if (!schema.replacing_tables.insert(this->name).second) {
+        throw TransactionException("Lance table replacement in progress: %s",
+                                   this->name.GetIdentifierName());
+      }
+    }
+    ~RestTableReplacement() {
+      lock_guard<mutex> guard(schema.table_lock);
+      schema.tables.erase(name);
+      schema.replacing_tables.erase(name);
+    }
+
+  private:
+    LanceSchemaEntry &schema;
+    Identifier name;
+  };
+
   vector<string> CachedDatasetKeys(ClientContext &context) {
     lock_guard<mutex> guard(table_lock);
     vector<string> keys;
@@ -752,7 +775,8 @@ public:
                  const string &tag, const int64_t *version) {
     lock_guard<mutex> guard(table_lock);
     auto current = tables.find(table.name);
-    if (current == tables.end() || current->second.get() != &table) {
+    if (current == tables.end() || current->second.get() != &table ||
+        replacing_tables.count(table.name)) {
       throw TransactionException(
           "Lance table changed concurrently; retry tag operation");
     }
@@ -778,6 +802,13 @@ public:
           api_key.c_str(), rest_ns->delimiter.c_str(),
           rest_ns->headers_tsv.c_str(), tag.c_str(), version);
     } else {
+      auto physical = FindDirectoryNamespaceTable(
+          *directory_ns, table.name.GetIdentifierName());
+      if (physical != table.NamespaceConfig().table_id) {
+        throw CatalogException("Lance directory listing does not match the "
+                               "bound table '%s'",
+                               table.NamespaceConfig().table_id);
+      }
       string display_uri;
       std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
           LanceOpenDatasetForTable(context, table, display_uri),
@@ -1053,7 +1084,12 @@ public:
     vector<string> option_keys;
     vector<string> option_values;
 
+    unique_ptr<RestTableReplacement> replacement;
     if (rest_ns) {
+      if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+        replacement =
+            make_uniq<RestTableReplacement>(*this, create_info.GetTableName());
+      }
       unordered_map<string, Value> overrides;
       if (!rest_ns->bearer_token_override.empty()) {
         overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
@@ -1221,7 +1257,9 @@ public:
       }
     }
 
-    InvalidateTableEntry(create_info.GetTableName());
+    if (!replacement) {
+      InvalidateTableEntry(create_info.GetTableName());
+    }
     return nullptr;
   }
 
@@ -1318,6 +1356,7 @@ private:
   unique_ptr<LanceTableGenerator> table_default_generator;
   mutex table_lock;
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
+  identifier_set_t replacing_tables;
 };
 
 static bool IsProtectedLanceSchema(const Identifier &name) {
@@ -1749,15 +1788,15 @@ public:
       public:
         PhysicalLanceCreateTableAs(
             PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-            string endpoint, string namespace_id, string delimiter,
-            string bearer_token_override, string api_key_override,
-            string headers_tsv, string table_name, string writer_mode,
-            string data_storage_version, int8_t enable_stable_row_ids_p,
-            vector<string> column_names_p, vector<LogicalType> column_types_p,
-            idx_t estimated_cardinality)
+            LanceSchemaEntry &schema, string endpoint, string namespace_id,
+            string delimiter, string bearer_token_override,
+            string api_key_override, string headers_tsv, string table_name,
+            string writer_mode, string data_storage_version,
+            int8_t enable_stable_row_ids_p, vector<string> column_names_p,
+            vector<LogicalType> column_types_p, idx_t estimated_cardinality)
             : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                                std::move(types_p), estimated_cardinality),
-              endpoint(std::move(endpoint)),
+              schema(schema), endpoint(std::move(endpoint)),
               namespace_id(std::move(namespace_id)),
               delimiter(std::move(delimiter)),
               bearer_token_override(std::move(bearer_token_override)),
@@ -1777,6 +1816,7 @@ public:
 
         struct GlobalState final : public GlobalSinkState {
           mutex lock;
+          unique_ptr<LanceSchemaEntry::RestTableReplacement> replacement;
 
           string endpoint;
           string namespace_id;
@@ -1837,6 +1877,11 @@ public:
               api_key_override, headers_tsv, table_name, writer_mode,
               data_storage_version, enable_stable_row_ids, column_names,
               column_types);
+          if (writer_mode == "overwrite") {
+            state->replacement =
+                make_uniq<LanceSchemaEntry::RestTableReplacement>(
+                    schema, Identifier(table_name));
+          }
 
           auto props = context.GetClientProperties();
           memset(&state->schema_root.arrow_schema, 0,
@@ -2001,6 +2046,7 @@ public:
             }
           }
 
+          gstate.replacement.reset();
           return SinkFinalizeType::READY;
         }
 
@@ -2032,6 +2078,7 @@ public:
         string GetName() const override { return "LanceCreateTableAs"; }
 
       private:
+        LanceSchemaEntry &schema;
         string endpoint;
         string namespace_id;
         string delimiter;
@@ -2090,7 +2137,7 @@ public:
       auto types = create_info.columns.GetColumnTypes();
       string mode = CreateTableModeFromConflict(create_info.on_conflict);
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
-          op.types, target_ns->endpoint, target_ns->namespace_id,
+          op.types, *schema, target_ns->endpoint, target_ns->namespace_id,
           target_ns->delimiter, target_ns->bearer_token_override,
           target_ns->api_key_override, target_ns->headers_tsv,
           create_info.GetTableName().GetIdentifierName(), mode,

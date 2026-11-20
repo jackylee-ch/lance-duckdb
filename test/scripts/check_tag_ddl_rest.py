@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from check_dml_returning_lifecycle import Result
 
 ROOT = Path(__file__).resolve().parents[2]
 DUCKDB = ROOT / "build/release/duckdb"
@@ -32,14 +33,25 @@ def sql(statement, expected_error=None):
     return result.stdout.strip()
 
 
-def concurrent_table_drop(attach, creating, dropped, release):
+def concurrent_table_ddl(attach, creating, dropped, release, release_drop, deny_drop):
     # Two native connections must share the catalog and its schema lock.
     suffix = "dylib" if sys.platform == "darwin" else "so"
     lib = ctypes.CDLL(str(ROOT / f"build/release/src/libduckdb.{suffix}"))
     db, writer, dropper = (ctypes.c_void_p() for _ in range(3))
 
-    def execute(connection, statement):
-        assert lib.duckdb_query(connection, statement.encode(), None) == 0, statement
+    lib.duckdb_result_error.restype = ctypes.c_char_p
+
+    def execute(connection, statement, expected_error=None):
+        result = Result()
+        try:
+            status = lib.duckdb_query(connection, statement.encode(), ctypes.byref(result))
+            message = (lib.duckdb_result_error(ctypes.byref(result)) or b"").decode()
+            if expected_error:
+                assert status and expected_error in message, (statement, message)
+            else:
+                assert not status, (statement, message)
+        finally:
+            lib.duckdb_destroy_result(ctypes.byref(result))
 
     assert lib.duckdb_open(None, ctypes.byref(db)) == 0
     try:
@@ -58,6 +70,24 @@ def concurrent_table_drop(attach, creating, dropped, release):
                 release.set()
             create.result()
             drop.result()
+
+            for definition in ("(id BIGINT)", "AS SELECT 1::BIGINT AS id"):
+                ddl = f"CREATE OR REPLACE TABLE {table} {definition}"
+                dropped.clear()
+                release_drop.clear()
+                replace = pool.submit(execute, dropper, ddl)
+                try:
+                    assert dropped.wait(10), "replacement never reached the namespace"
+                    execute(writer, f"ALTER TABLE {table} CREATE TAG 'racing' AT VERSION 1", "changed concurrently")
+                finally:
+                    release_drop.set()
+                replace.result()
+                deny_drop.set()
+                try:
+                    execute(dropper, ddl, "replacement denied")
+                finally:
+                    deny_drop.clear()
+                execute(writer, f"ALTER TABLE {table} CREATE TAG 'after' AT VERSION 1")
     finally:
         release.set()
         lib.duckdb_disconnect(ctypes.byref(dropper))
@@ -80,6 +110,10 @@ def main():
         writes = []
         order = []
         creating, dropped, release = (threading.Event() for _ in range(3))
+        release_drop = threading.Event()
+        release_drop.set()
+        deny_drop = threading.Event()
+        location = dataset
         table_pages = [["samples.v2"]]
         tag_mode = "normal"
 
@@ -88,6 +122,7 @@ def main():
                 pass
 
             def route(self):
+                nonlocal location
                 uri = urlparse(self.path)
                 path = unquote(uri.path)
                 payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -112,7 +147,7 @@ def main():
                     response = {"namespaces": []}
                 elif "/table/" in path and path.endswith("/describe"):
                     fields = [{"name": "id", "nullable": True, "type": {"type": "int64"}}]
-                    response = {"schema": {"fields": fields}, "location": str(dataset)}
+                    response = {"schema": {"fields": fields}, "location": str(location)}
                 elif path == "/v1/table/Team|samples.v2/tags/list":
                     assert self.command == "POST" and query["delimiter"] == ["|"]
                     if tag_mode == "denied" and token == "next":
@@ -139,8 +174,15 @@ def main():
                         response = {}
                 elif path == "/v1/table/Team|samples.v2/drop":
                     dropped.set()
-                    order.append("drop")
-                    response = {}
+                    assert release_drop.wait(10)
+                    if deny_drop.is_set():
+                        status, response = 403, {"message": "replacement denied"}
+                    else:
+                        order.append("drop")
+                        response = {}
+                elif path == "/v1/table/Team|samples.v2/declare":
+                    location = Path(tmp) / f"replacement-{len(order)}.lance"
+                    response = {"location": str(location)}
                 else:
                     status, response = 404, {"message": "unknown route"}
                 data = json.dumps(response).encode()
@@ -184,8 +226,8 @@ def main():
                     for operation in ("CREATE TAG 'blocked' AT VERSION 1", "DROP TAG 'main_tag'"):
                         sql(warm + operation, expected_error=error)
                 table_pages = [["samples.v2"]]
-                concurrent_table_drop(attach, creating, dropped, release)
-                assert order == ["create", "drop"], order
+                concurrent_table_ddl(attach, creating, dropped, release, release_drop, deny_drop)
+                assert order == ["create", "drop", "drop", "drop"], order
                 assert sql(f"SELECT tag FROM lance_tags('{dataset}')") == "main_tag"
             finally:
                 server.shutdown()
@@ -198,8 +240,16 @@ def main():
             ("delete", "main_tag", None),
             ("create", "unique", 1),
             ("create", "pending", 1),
+            ("create", "after", 1),
+            ("create", "after", 1),
         ]
         assert writes == expected, writes
+
+        file_store = Path(tmp).as_uri().replace("file:", "file-object-store:", 1)
+        file_alter = f"ATTACH '{file_store}' AS ns (TYPE LANCE); ALTER TABLE ns.main.accessible "
+        sql(file_alter + "DROP TAG 'MAIN_TAG'", "does not exist")
+        sql(file_alter + "CREATE TAG 'Exact' AT VERSION 1; ALTER TABLE ns.main.accessible DROP TAG 'Exact'")
+        assert sql(f"SELECT tag FROM lance_tags('{dataset}')") == "main_tag"
 
 
 if __name__ == "__main__":

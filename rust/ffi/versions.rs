@@ -35,7 +35,7 @@ impl<'a> TagMutation<'a> {
 
 async fn drop_dataset_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
     let store = dataset.object_store(None).await?;
-    if store.is_local() {
+    if store.is_local() || store.scheme() == "file-object-store" {
         // A case-insensitive volume can open another spelling of this name.
         // Compare the stored directory entry before asking Lance to delete it.
         let root = dataset.refs.root()?.path;

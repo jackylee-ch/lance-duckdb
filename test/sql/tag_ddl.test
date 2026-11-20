@@ -177,3 +177,36 @@ SELECT (SELECT max(version) FROM lance_versions('tag_ns.main."tag.case"')),
        (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"'));
 ----
 1	0
+
+# The shared memory store keeps case-distinct physical tables on every platform.
+statement ok
+ATTACH 'shared-memory://tag-ddl/root' AS case_ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT 1 AS id) TO 'shared-memory://tag-ddl/root/Sales.lance' (FORMAT lance);
+
+statement ok
+ALTER TABLE case_ns.main.Sales CREATE TAG 'original' AT VERSION 1;
+
+statement ok
+COPY (SELECT 2 AS id) TO 'shared-memory://tag-ddl/root/sales.lance' (FORMAT lance);
+
+statement error
+ALTER TABLE case_ns.main.sales DROP TAG 'original';
+----
+Ambiguous Lance directory table names
+
+statement error
+ALTER TABLE case_ns.main.sales CREATE TAG 'new' AT VERSION 1;
+----
+Ambiguous Lance directory table names
+
+query T
+SELECT tag FROM lance_tags('shared-memory://tag-ddl/root/Sales.lance');
+----
+original
+
+query I
+SELECT count(*) FROM lance_tags('shared-memory://tag-ddl/root/sales.lance');
+----
+0
