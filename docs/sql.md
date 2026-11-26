@@ -382,6 +382,7 @@ Positional arguments:
 - `query` (VARCHAR): Query string, or a structured query in the two-argument form.
 
 Named parameters:
+- `version` (optional): Search a fixed version of a dataset path or object store URI, as in `lance_vector_search`. Both FTS signatures use the selected snapshot's text columns, index and term statistics to compute `_score`. Omit it to search the current version.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.

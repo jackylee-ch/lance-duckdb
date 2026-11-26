@@ -1545,6 +1545,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   auto target =
       ResolveLanceDataset(context, input.inputs[0],
                           LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
+  auto version = BindSearchVersion(input, target);
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
     if (!structured_query) {
@@ -1570,9 +1571,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         "tables");
   }
 
-  result->file_path.clear();
-  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
-                                                 &result->dataset_cache_hit);
+  result->dataset_entry = OpenSearchDataset(
+      context, target, version, result->file_path, result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -2141,6 +2141,7 @@ static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("version", LogicalType::ANY);
       options.Add("k", LogicalType::BIGINT);
       options.Add("prefilter", LogicalType::BOOLEAN);
       options.Add("filter", LogicalType::VARCHAR);

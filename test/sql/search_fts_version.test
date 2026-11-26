@@ -1,0 +1,80 @@
+# name: test/sql/search_fts_version.test
+# description: Both full-text search signatures use the selected snapshot's columns, postings and scores
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM (VALUES (11, 'orchid petal'), (12, 'orchid seed'), (13, 'fir wood')) t(id, body))
+TO '{TEST_DIR}/docs.lance' (FORMAT lance);
+
+statement ok
+CREATE INDEX body_idx ON '{TEST_DIR}/docs.lance' (body) USING INVERTED WITH (with_position = true);
+
+statement ok
+CREATE TEMP TABLE expected AS SELECT id, body, _rowid AS rid, _score AS score
+FROM lance_fts('{TEST_DIR}/docs.lance', 'body', 'orchid');
+
+statement ok
+PREPARE live_fts AS SELECT list(id ORDER BY id)
+FROM lance_fts('{TEST_DIR}/docs.lance', '{"match":{"terms":"orchid"}}');
+
+query T
+EXECUTE live_fts;
+----
+[11, 12]
+
+statement ok
+COPY (SELECT 91 AS id, 'orchid' AS title)
+TO '{TEST_DIR}/docs.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX title_idx ON '{TEST_DIR}/docs.lance' (title) USING INVERTED;
+
+query T
+EXECUTE live_fts;
+----
+[91]
+
+# Compare the entire hit set, including the original row IDs and full-precision scores.
+query I
+SELECT list(row(id, body, _rowid, _score) ORDER BY id) =
+       (SELECT list(row(id, body, rid, score) ORDER BY id) FROM expected)
+FROM lance_fts('{TEST_DIR}/docs.lance', 'body', 'orchid', version = 2);
+----
+true
+
+query I
+SELECT list(row(id, body, _rowid, _score) ORDER BY id) =
+       (SELECT list(row(id, body, rid, score) ORDER BY id) FROM expected)
+FROM lance_fts('{TEST_DIR}/docs.lance', '{"match":{"terms":"orchid"}}', version = 2);
+----
+true
+
+query IT
+SELECT id, body FROM lance_fts('{TEST_DIR}/docs.lance',
+    '{"phrase":{"column":"body","terms":"orchid petal"}}', version = 2);
+----
+11	orchid petal
+
+query TT
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id
+FROM lance_fts('{TEST_DIR}/docs.lance', 'body', 'orchid', version = 2);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Plan": \[[\s\S]*" *MatchQuery: column=body[\s\S]*
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement error
+SELECT id FROM lance_fts('ns.main.docs', 'body', 'orchid', version = 2);
+----
+Search by version requires a dataset path or URI
+
+statement ok
+VACUUM LANCE ns.main.docs WITH (retain_n_versions = 1);
+
+statement error
+SELECT id FROM lance_fts('{TEST_DIR}/docs.lance', 'body', 'orchid', version = 2);
+----
+Failed to open version 2
