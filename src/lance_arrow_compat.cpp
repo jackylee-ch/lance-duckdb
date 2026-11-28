@@ -43,6 +43,15 @@ bool LanceArrowFieldContainsBlob(const ArrowSchema &field) {
   return false;
 }
 
+vector<string> LanceArrowPhysicalFieldNames(const ArrowSchema &schema) {
+  vector<string> result;
+  result.reserve(schema.n_children);
+  for (int64_t i = 0; i < schema.n_children; i++) {
+    result.emplace_back(schema.children[i]->name);
+  }
+  return result;
+}
+
 LanceArrowBatch::LanceArrowBatch(void *batch, const char *export_error) {
   std::unique_ptr<void, decltype(&lance_free_batch)> batch_owner(
       batch, lance_free_batch);

@@ -85,6 +85,12 @@ bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema);
 // (Blob v1 or Blob v2). Ordinary Arrow binary fields do not match.
 bool LanceArrowFieldContainsBlob(const ArrowSchema &field);
 
+// Top-level Lance field names of an exported schema. DuckDB deduplicates
+// case-insensitive Arrow names (Foo, foo -> Foo, foo_1) when it builds the
+// scan schema, but Lance field names are case-sensitive, so projection and
+// filter pushdown must address these physical names.
+vector<string> LanceArrowPhysicalFieldNames(const ArrowSchema &schema);
+
 // DuckDB's Arrow exporter names list child fields `l`; Arrow (and therefore
 // Lance, pyarrow and DataFusion) call them `item`. Lance persists the name, and
 // DataFusion's array-function coercion rewrites any list argument to an `item`

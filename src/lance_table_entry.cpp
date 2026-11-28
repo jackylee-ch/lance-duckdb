@@ -67,6 +67,7 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
   result.coerced_columns = std::move(coercion.storage_coerced_columns);
   result.json_columns = std::move(coercion.json_columns);
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema);
+  result.physical_names = LanceArrowPhysicalFieldNames(schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
   if (names.size() != types.size()) {
@@ -253,6 +254,7 @@ BuildLanceTableEntryFromDataset(ClientContext &context,
                                        base.DatasetUri());
   }
   entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+  entry->SetPhysicalColumnNames(std::move(live.physical_names));
   entry->SetJsonColumnNames(std::move(live.json_columns));
   entry->SetBlobColumns(std::move(live.blob_columns));
   entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));
@@ -767,6 +769,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
         make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
+  copy->SetPhysicalColumnNames(physical_column_names);
   copy->SetJsonColumnNames(json_column_names);
   copy->SetBlobColumns(blob_column_flags);
   copy->SetWritableBlobV2Columns(writable_blob_v2_columns);
@@ -869,6 +872,7 @@ bool LanceTableEntry::MatchesLiveSchemaState(
     const LanceTableSchema &live) const {
   if (columns.LogicalColumnCount() != live.columns.LogicalColumnCount() ||
       CoercedColumnNames() != live.coerced_columns ||
+      physical_column_names != live.physical_names ||
       json_column_names != live.json_columns ||
       writable_blob_v2_columns != live.writable_blob_v2_columns ||
       NotNullIndexesFromConstraints(constraints) !=

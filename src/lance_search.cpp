@@ -242,8 +242,11 @@ static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
 // Search schemas end with `_rowid`. It stays in the bind data's names and
 // types, which index the Arrow batches, but DuckDB binds it only as the
 // virtual column LANCE_COLUMN_IDENTIFIER_ROW_ID, as for table scans: it can be
-// selected by name and `SELECT *` leaves it out. Returns its index.
+// selected by name and `SELECT *` leaves it out. `result_names` are the
+// physical Lance names that projections and filters address; `visible_names`
+// are the (possibly deduplicated) names DuckDB binds. Returns its index.
 static idx_t ExposeSearchColumns(const vector<string> &result_names,
+                                 const vector<string> &visible_names,
                                  const vector<LogicalType> &result_types,
                                  vector<Identifier> &names,
                                  vector<LogicalType> &return_types) {
@@ -254,7 +257,7 @@ static idx_t ExposeSearchColumns(const vector<string> &result_names,
   names.clear();
   return_types.clear();
   for (idx_t i = 0; i < rowid_index; i++) {
-    names.emplace_back(result_names[i]);
+    names.emplace_back(visible_names[i]);
     return_types.push_back(result_types[i]);
   }
   return rowid_index;
@@ -292,22 +295,27 @@ static idx_t PopulateNamespaceSearchSchema(const LanceTableEntry &table,
                                            vector<LogicalType> &result_types,
                                            vector<Identifier> &names,
                                            vector<LogicalType> &return_types) {
-  vector<string> field_names;
+  vector<string> field_names = table.PhysicalColumnNames();
+  vector<string> visible_names;
   vector<LogicalType> field_types;
   field_names.reserve(table.GetColumns().PhysicalColumnCount() + 2);
+  visible_names.reserve(table.GetColumns().PhysicalColumnCount() + 2);
   field_types.reserve(table.GetColumns().PhysicalColumnCount() + 2);
   for (auto &col : table.GetColumns().Physical()) {
-    field_names.push_back(col.Name().GetIdentifierName());
+    visible_names.push_back(col.Name().GetIdentifierName());
     field_types.push_back(col.Type());
   }
   field_names.push_back(metric_name);
+  visible_names.push_back(metric_name);
   field_types.push_back(LogicalType::FLOAT);
   field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
+  visible_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
   field_types.push_back(LogicalType::UBIGINT);
 
   result_names = std::move(field_names);
   result_types = std::move(field_types);
-  return ExposeSearchColumns(result_names, result_types, names, return_types);
+  return ExposeSearchColumns(result_names, visible_names, result_types, names,
+                             return_types);
 }
 
 // A DELETE pins its target dataset for the whole statement, and a table scan
@@ -355,7 +363,7 @@ static void PopulatePinnedSearchSchema(
   LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                schema_root.arrow_schema);
-  if (arrow_table.GetNames() != names) {
+  if (LanceArrowPhysicalFieldNames(schema_root.arrow_schema) != names) {
     throw CatalogException(
         "Lance table \"%s\" was changed externally: its dataset no longer "
         "matches the schema %s was bound with - please re-run the query.",
@@ -801,11 +809,13 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
       LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
   result->rowid_index =
-      ExposeSearchColumns(result->names, result->types, names, return_types);
+      ExposeSearchColumns(result->names, result->arrow_table.GetNames(),
+                          result->types, names, return_types);
   return std::move(result);
 }
 
@@ -1599,11 +1609,13 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
       LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
   result->rowid_index =
-      ExposeSearchColumns(result->names, result->types, names, return_types);
+      ExposeSearchColumns(result->names, result->arrow_table.GetNames(),
+                          result->types, names, return_types);
   return std::move(result);
 }
 
@@ -1774,11 +1786,13 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
       LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
   result->rowid_index =
-      ExposeSearchColumns(result->names, result->types, names, return_types);
+      ExposeSearchColumns(result->names, result->arrow_table.GetNames(),
+                          result->types, names, return_types);
   return std::move(result);
 }
 

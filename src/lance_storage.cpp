@@ -430,6 +430,7 @@ public:
     auto entry = make_uniq<LanceTableEntry>(schema.catalog, schema, info,
                                             std::move(cfg), std::move(pinned));
     entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+    entry->SetPhysicalColumnNames(std::move(live.physical_names));
     entry->SetJsonColumnNames(std::move(live.json_columns));
     entry->SetBlobColumns(std::move(live.blob_columns));
     entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));
@@ -652,6 +653,7 @@ private:
     auto entry = make_uniq<LanceTableEntry>(
         catalog, schema, info, std::move(cfg), std::move(snapshot));
     entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+    entry->SetPhysicalColumnNames(std::move(live.physical_names));
     entry->SetJsonColumnNames(std::move(live.json_columns));
     entry->SetBlobColumns(std::move(live.blob_columns));
     entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));

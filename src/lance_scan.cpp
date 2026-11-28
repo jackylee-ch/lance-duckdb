@@ -1225,7 +1225,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
       LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
   result->blob_columns =
@@ -1250,7 +1251,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names.clear();
-  for (const auto &name : result->names) {
+  for (const auto &name : result->arrow_table.GetNames()) {
     names.emplace_back(name);
   }
   return_types = result->types;
@@ -1328,7 +1329,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
       LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = std::move(schema_coercion.json_columns);
   result->blob_columns =
@@ -1354,7 +1356,7 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names.clear();
-  for (const auto &name : result->names) {
+  for (const auto &name : result->arrow_table.GetNames()) {
     names.emplace_back(name);
   }
   return_types = result->types;
@@ -4324,8 +4326,8 @@ static TableFunction LanceTableScanFunction() {
 
 static void PopulateNamespaceQueryScanSchema(const LanceTableEntry &table,
                                              LanceScanBindData &result) {
+  result.names = table.PhysicalColumnNames();
   for (auto &column : table.GetColumns().Physical()) {
-    result.names.push_back(column.Name().GetIdentifierName());
     result.types.push_back(column.Type());
   }
   result.json_columns = table.JsonColumnNames();
@@ -4381,7 +4383,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   lance_free_schema(schema_handle);
   auto live = LanceTableSchema::FromArrow(
       context, result->schema_root.arrow_schema, result->arrow_table);
-  result->names = result->arrow_table.GetNames();
+  result->names =
+      LanceArrowPhysicalFieldNames(result->schema_root.arrow_schema);
   result->types = result->arrow_table.GetTypes();
   result->json_columns = live.json_columns;
   result->blob_columns = live.blob_columns;

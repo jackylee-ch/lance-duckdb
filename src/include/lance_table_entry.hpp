@@ -37,6 +37,9 @@ struct LanceTableSchema {
   Value comment;
   vector<unique_ptr<Constraint>> constraints;
   vector<string> coerced_columns;
+  // Physical Lance field names. DuckDB deduplicates case-insensitive names in
+  // `columns` (Foo, foo -> Foo, foo_1); projection and filters need these.
+  vector<string> physical_names;
   // Top-level columns whose field or a descendant carries a canonical
   // arrow.json extension.
   vector<string> json_columns;
@@ -178,6 +181,12 @@ public:
   void SetCoercedColumnNames(vector<string> names) {
     coerced_column_names = std::move(names);
   }
+  const vector<string> &PhysicalColumnNames() const {
+    return physical_column_names;
+  }
+  void SetPhysicalColumnNames(vector<string> names) {
+    physical_column_names = std::move(names);
+  }
   bool HasJsonColumns() const { return !json_column_names.empty(); }
   bool IsJsonColumn(const string &name) const;
   const vector<string> &JsonColumnNames() const { return json_column_names; }
@@ -221,6 +230,7 @@ private:
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;
+  vector<string> physical_column_names;
   vector<string> json_column_names;
   vector<bool> blob_column_flags;
   vector<string> writable_blob_v2_columns;

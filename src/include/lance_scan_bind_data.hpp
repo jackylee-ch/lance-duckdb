@@ -24,6 +24,8 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowSchemaWrapper scan_schema_root;
   ArrowTableSchema arrow_table;
   ArrowTableSchema scan_arrow_table;
+  // Physical Lance field names. These can differ from the DuckDB-visible
+  // column names, which DuckDB deduplicates case-insensitively.
   vector<string> names;
   vector<LogicalType> types;
   vector<string> json_columns;
