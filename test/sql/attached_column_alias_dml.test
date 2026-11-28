@@ -1,5 +1,5 @@
 # name: test/sql/attached_column_alias_dml.test
-# description: UPDATE and MERGE write physical field names when DuckDB deduplicates case-insensitive columns
+# description: UPDATE, INSERT and MERGE write physical field names when DuckDB deduplicates case-insensitive columns
 # group: [sql]
 
 require lance
@@ -61,3 +61,17 @@ SELECT * FROM ns.t ORDER BY 1;
 ----
 1	5	8
 2	6	31
+
+statement ok
+INSERT INTO ns.t VALUES (3, 4, 9);
+
+statement ok
+MERGE INTO ns.t t USING (VALUES (4, 5, 6)) s(a, b, c) ON t."Foo" = s.a WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b, s.c);
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	5	8
+2	6	31
+3	4	9
+4	5	6

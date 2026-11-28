@@ -998,7 +998,8 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
   table_column_names.reserve(op.table.GetColumns().PhysicalColumnCount());
   table_column_types.reserve(op.table.GetColumns().PhysicalColumnCount());
   for (auto &col : op.table.GetColumns().Physical()) {
-    table_column_names.push_back(col.Name().GetIdentifierName());
+    table_column_names.push_back(
+        lance_table->PhysicalColumnName(col.StorageOid()));
     table_column_types.push_back(col.Type());
   }
 

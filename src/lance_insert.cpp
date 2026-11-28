@@ -297,7 +297,7 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   vector<string> column_names;
   vector<LogicalType> column_types;
   for (auto &col : op.table.GetColumns().Physical()) {
-    column_names.push_back(col.Name().GetIdentifierName());
+    column_names.push_back(lance_table->PhysicalColumnName(col.StorageOid()));
     column_types.push_back(col.Type());
   }
 
