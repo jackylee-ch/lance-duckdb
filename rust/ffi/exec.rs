@@ -16,7 +16,7 @@ use futures::StreamExt;
 use lance_table::format::Fragment;
 
 use crate::error::{clear_last_error, datafusion_error_code, set_last_error, ErrorCode};
-use crate::exec_ir::{agg_ir_to_df_expr, output_type_to_arrow, parse_exec_ir_v1};
+use crate::exec_ir::{agg_ir_to_df_expr, literal_column, output_type_to_arrow, parse_exec_ir_v1};
 use crate::runtime;
 
 use super::memory_pool::LanceMemoryPoolCallbacks;
@@ -264,12 +264,12 @@ async fn build_exec_df(
         let expr = if let Some(hint) = &g.output_type {
             let dtype = output_type_to_arrow(hint)?;
             Expr::Cast(datafusion_expr::Cast::new(
-                Box::new(datafusion::prelude::col(name)),
+                Box::new(literal_column(name)),
                 dtype,
             ))
             .alias(name)
         } else {
-            datafusion::prelude::col(name)
+            literal_column(name)
         };
         select_exprs.push(expr);
     }
@@ -278,12 +278,12 @@ async fn build_exec_df(
         let expr = if let Some(hint) = &agg.output_type {
             let dtype = output_type_to_arrow(hint)?;
             Expr::Cast(datafusion_expr::Cast::new(
-                Box::new(datafusion::prelude::col(name)),
+                Box::new(literal_column(name)),
                 dtype,
             ))
             .alias(name)
         } else {
-            datafusion::prelude::col(name)
+            literal_column(name)
         };
         select_exprs.push(expr);
     }
@@ -297,7 +297,7 @@ async fn build_exec_df(
     let sort_exprs = exec_ir
         .order_by
         .iter()
-        .map(|o| datafusion::prelude::col(&o.column).sort(o.asc, o.nulls_first))
+        .map(|o| literal_column(&o.column).sort(o.asc, o.nulls_first))
         .collect();
 
     df.sort(sort_exprs).map_err(|e| e.to_string())

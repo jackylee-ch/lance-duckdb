@@ -187,6 +187,9 @@ public:
   void SetPhysicalColumnNames(vector<string> names) {
     physical_column_names = std::move(names);
   }
+  // Physical Lance field name of the catalog column at `index`. Writers must
+  // use it instead of the DuckDB-visible name, which is deduplicated.
+  const string &PhysicalColumnName(idx_t index) const;
   bool HasJsonColumns() const { return !json_column_names.empty(); }
   bool IsJsonColumn(const string &name) const;
   const vector<string> &JsonColumnNames() const { return json_column_names; }

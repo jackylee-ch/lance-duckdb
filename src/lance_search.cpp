@@ -229,9 +229,16 @@ static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
                                            const string &column,
                                            const string &function_name,
                                            const string &argument_name) {
-  for (auto &col : table.GetColumns().Physical()) {
-    if (StringUtil::CIEquals(col.Name().GetIdentifierName(), column)) {
-      return col.Name().GetIdentifierName();
+  // The argument names a physical Lance field, as it does for path and
+  // versioned searches, so deduplicated catalog names never reach query_table.
+  for (auto &physical : table.PhysicalColumnNames()) {
+    if (physical == column) {
+      return physical;
+    }
+  }
+  for (auto &physical : table.PhysicalColumnNames()) {
+    if (StringUtil::CIEquals(physical, column)) {
+      return physical;
     }
   }
   throw InvalidInputException(function_name + " requires " + argument_name +

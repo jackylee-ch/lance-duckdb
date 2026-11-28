@@ -362,23 +362,23 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     if (op.return_chunk) {
       assigned_columns.push_back(op.columns[i].index);
     }
-    auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
-    if (lance_table->IsCoercedColumn(target_col.Name().GetIdentifierName())) {
+    const auto &target_name =
+        lance_table->PhysicalColumnName(op.columns[i].index);
+    if (lance_table->IsCoercedColumn(target_name)) {
       throw NotImplementedException(
           "UPDATE on Lance table '" + lance_table->name +
-          "' is not supported: column(s) [" +
-          target_col.Name().GetIdentifierName() +
+          "' is not supported: column(s) [" + target_name +
           "] have Arrow types DuckDB cannot represent natively, so the "
           "catalog exposes a coerced type. Writing in the coerced type would "
           "silently change the on-disk storage.");
     }
-    if (lance_table->IsJsonColumn(target_col.Name().GetIdentifierName())) {
+    if (lance_table->IsJsonColumn(target_name)) {
       throw NotImplementedException(
           "UPDATE on Lance table '" + lance_table->name +
           "' is not supported because it writes JSON column(s) [" +
-          target_col.Name().GetIdentifierName() + "]");
+          target_name + "]");
     }
-    set_columns.push_back(target_col.Name().GetIdentifierName());
+    set_columns.push_back(target_name);
     if (!op.expressions[i]) {
       throw InternalException("Lance UPDATE has null SET expression");
     }

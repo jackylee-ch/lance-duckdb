@@ -777,9 +777,17 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 
+const string &LanceTableEntry::PhysicalColumnName(idx_t index) const {
+  if (index >= physical_column_names.size()) {
+    throw InternalException("Lance column index %llu has no physical field",
+                            static_cast<unsigned long long>(index));
+  }
+  return physical_column_names[index];
+}
+
 bool LanceTableEntry::IsCoercedColumn(const string &name) const {
   for (const auto &coerced_column : coerced_column_names) {
-    if (StringUtil::CIEquals(coerced_column, name)) {
+    if (coerced_column == name) {
       return true;
     }
   }
@@ -788,7 +796,7 @@ bool LanceTableEntry::IsCoercedColumn(const string &name) const {
 
 bool LanceTableEntry::IsJsonColumn(const string &name) const {
   for (const auto &json_column : json_column_names) {
-    if (StringUtil::CIEquals(json_column, name)) {
+    if (json_column == name) {
       return true;
     }
   }

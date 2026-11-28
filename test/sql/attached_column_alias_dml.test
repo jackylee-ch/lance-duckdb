@@ -1,0 +1,63 @@
+# name: test/sql/attached_column_alias_dml.test
+# description: UPDATE and MERGE write physical field names when DuckDB deduplicates case-insensitive columns
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/column_alias_dml' AS ns (TYPE LANCE);
+
+# The physical fields are Foo, foo and foo_1. The attached catalog exposes
+# them as Foo, foo_1 and foo_1_1.
+statement ok
+COPY (SELECT 1 AS "Foo", 2 AS "foo", 3 AS "foo_1" UNION ALL SELECT 10, 20, 30) TO '{TEST_DIR}/column_alias_dml/t.lance' (FORMAT lance);
+
+# The predicate reads physical foo; the assignment must write physical foo.
+query I
+UPDATE ns.t SET foo_1 = foo_1 + 100 WHERE foo_1 = 2 RETURNING foo_1;
+----
+102
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	102	3
+10	20	30
+
+query I
+UPDATE ns.t SET foo_1_1 = 7 WHERE "Foo" = 10 RETURNING foo_1_1;
+----
+7
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	102	3
+10	20	7
+
+statement ok
+UPDATE ns.t SET "Foo" = 2, foo_1 = 21, foo_1_1 = 31 WHERE "Foo" = 10;
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	102	3
+2	21	31
+
+statement ok
+MERGE INTO ns.t t USING (VALUES (1, 5), (2, 6)) s(k, v) ON t."Foo" = s.k WHEN MATCHED THEN UPDATE SET foo_1 = s.v;
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	5	3
+2	6	31
+
+statement ok
+MERGE INTO ns.t t USING (VALUES (1, 8)) s(k, v) ON t.foo_1 = s.v - 3 WHEN MATCHED THEN UPDATE SET foo_1_1 = s.v;
+
+query III
+SELECT * FROM ns.t ORDER BY 1;
+----
+1	5	8
+2	6	31

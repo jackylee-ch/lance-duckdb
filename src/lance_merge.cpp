@@ -909,16 +909,13 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         vector<string> updated_coerced_columns;
         vector<string> updated_json_columns;
         for (auto column_idx : bound_action->columns) {
-          auto &target_column = op.table.GetColumns().GetColumn(column_idx);
-          if (lance_table->IsCoercedColumn(
-                  target_column.Name().GetIdentifierName())) {
-            updated_coerced_columns.push_back(
-                target_column.Name().GetIdentifierName());
+          const auto &target_name =
+              lance_table->PhysicalColumnName(column_idx.index);
+          if (lance_table->IsCoercedColumn(target_name)) {
+            updated_coerced_columns.push_back(target_name);
           }
-          if (lance_table->IsJsonColumn(
-                  target_column.Name().GetIdentifierName())) {
-            updated_json_columns.push_back(
-                target_column.Name().GetIdentifierName());
+          if (lance_table->IsJsonColumn(target_name)) {
+            updated_json_columns.push_back(target_name);
           }
         }
         if (!updated_coerced_columns.empty()) {
@@ -934,10 +931,8 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         action->update_columns = std::move(bound_action->columns);
         action->update_column_names.reserve(action->update_columns.size());
         for (auto &col_idx : action->update_columns) {
-          action->update_column_names.push_back(op.table.GetColumns()
-                                                    .GetColumn(col_idx)
-                                                    .Name()
-                                                    .GetIdentifierName());
+          action->update_column_names.push_back(
+              lance_table->PhysicalColumnName(col_idx.index));
         }
         break;
       }

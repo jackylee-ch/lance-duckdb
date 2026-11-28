@@ -1,6 +1,6 @@
 use datafusion::functions_aggregate::expr_fn::{avg, max, min, sum};
-use datafusion::prelude::{col, lit};
-use datafusion_common::ScalarValue;
+use datafusion::prelude::lit;
+use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::{Expr, Operator};
 
 #[derive(Debug, Clone)]
@@ -262,9 +262,15 @@ fn parse_expr_ir(c: &mut Cursor<'_>) -> Result<ExprIr, String> {
     }
 }
 
+/// A column reference by its literal name. `col()` would parse the name as an
+/// SQL identifier, folding case and splitting on dots.
+pub fn literal_column(name: &str) -> Expr {
+    Expr::Column(Column::new_unqualified(name))
+}
+
 pub fn expr_ir_to_df_expr(expr: &ExprIr) -> Result<Expr, String> {
     match expr {
-        ExprIr::ColumnRef(name) => Ok(col(name)),
+        ExprIr::ColumnRef(name) => Ok(literal_column(name)),
         ExprIr::Literal(lit_ir) => Ok(lit(literal_ir_to_scalar(lit_ir)?)),
         ExprIr::Binary { op, lhs, rhs } => {
             let lhs = expr_ir_to_df_expr(lhs)?;
